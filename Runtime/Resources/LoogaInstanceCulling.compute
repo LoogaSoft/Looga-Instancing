@@ -1,0 +1,496 @@
+#pragma kernel ApplyOcclusion
+#pragma kernel SelectVisibility
+#pragma kernel SelectVisibilityOcclusion
+#pragma kernel ResetOcclusionStats
+#pragma kernel Reset
+#pragma kernel ResetAll
+#pragma kernel Cull
+#pragma kernel CullParts
+#pragma kernel UpdateLod
+#pragma kernel UpdateMeshLod
+#pragma kernel PatchRawBuffer
+#pragma target 5.0
+
+ByteAddressBuffer _PatchSource;
+RWByteAddressBuffer _PatchDestination;
+int _PatchSourceOffset;
+int _PatchDestinationOffset;
+int _PatchWordCount;
+
+[numthreads(64, 1, 1)]
+void PatchRawBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_PatchWordCount) return;
+    uint value = _PatchSource.Load((uint)(_PatchSourceOffset + id.x) * 4);
+    _PatchDestination.Store((uint)(_PatchDestinationOffset + id.x) * 4, value);
+}
+
+struct InstanceBounds
+{
+    float4 sphere;
+    float4 lod;
+    float4 state;
+};
+StructuredBuffer<InstanceBounds> _Bounds;
+RWByteAddressBuffer _Visible;
+RWByteAddressBuffer _Arguments;
+RWStructuredBuffer<float4> _Selection;
+RWStructuredBuffer<float4> _Clusters;
+StructuredBuffer<uint> _SpatialOrder;
+RWByteAddressBuffer _OcclusionStatistics;
+int _SelectionMode;
+int _UseSpatialOrder;
+int _MeasureOcclusion;
+float4 _Quality; // Density, minimum projected pixels, shadow fade distance, viewport height.
+int _Count;
+int _Capacity;
+int _BucketStride;
+int _Part;
+int _PartCount;
+int _PlaneCount;
+int _SplitCount;
+float4 _Planes[64];
+float4 _Splits[16];
+float4 _Camera;
+float4 _Lod; // Scale, orthographic, max distance, minimum shadow LOD.
+float4 _Thresholds[2];
+float4 _FadeWidths[2];
+int _CrossFade;
+int _PercentageLods;
+int _LodCount;
+int _PartLod;
+int _PartFlip;
+int _AnimatedFade;
+int _MeshFade;
+RWStructuredBuffer<float4> _MeshHistory;
+ByteAddressBuffer _InstanceData;
+int _MeshLevel;
+int _MeshLevels;
+float _MeshMetric;
+float4 _MeshSelection;
+float4 _MeshCenter;
+float4 _MeshExtents;
+
+struct PartCullData
+{
+    float4 header; // LOD, winding flip, mesh level, mesh level count.
+    float4 selection;
+    float4 center;
+    float4 extents;
+};
+StructuredBuffer<PartCullData> _PartParameters;
+
+int SelectMeshLevel(uint index, uint part, int meshLevels, float4 meshSelection,
+    float3 meshCenter, float3 meshExtents)
+{
+    if (meshSelection.w >= 0) return clamp((int)meshSelection.w, 0, meshLevels - 1);
+    uint address = 64 + (part * _Capacity + index) * 48;
+    float3 x = asfloat(_InstanceData.Load3(address));
+    float3 y = asfloat(_InstanceData.Load3(address + 12));
+    float3 z = asfloat(_InstanceData.Load3(address + 24));
+    float3 t = asfloat(_InstanceData.Load3(address + 36));
+    float3 center = t + x * meshCenter.x + y * meshCenter.y + z * meshCenter.z;
+    float3 extents = abs(x) * meshExtents.x + abs(y) * meshExtents.y + abs(z) * meshExtents.z;
+    float diameter = 2 * sqrt(max(dot(extents, extents), 0.00001));
+    float metric = _MeshMetric * (_Lod.y > 0 ? 1 : distance(center, _Camera.xyz));
+    float level = max(0, log2(max(metric / diameter, 0.000001)) * meshSelection.x + meshSelection.y);
+    return (int)clamp(floor(level + meshSelection.z), 0, meshLevels - 1);
+}
+float4 _TransitionTime;
+RWStructuredBuffer<float4> _LodHistory;
+
+int SelectLevel(float ratio)
+{
+    for (int level = 0; level < _LodCount; level++)
+    {
+        if (ratio >= _Thresholds[(uint)level >> 2][(uint)level & 3]) return level;
+    }
+    return _LodCount;
+}
+
+void StoreTransition(uint index, int selected, float generation)
+{
+    float4 previous = _LodHistory[index];
+    if (previous.w != generation)
+    {
+        previous = float4(selected, selected, _TransitionTime.x, generation);
+    }
+    else if (previous.x == previous.y || _TransitionTime.x - previous.z >= _TransitionTime.y)
+    {
+        previous.x = previous.y;
+        if ((int)previous.y != selected)
+        {
+            previous.y = selected;
+            previous.z = _TransitionTime.x;
+        }
+    }
+    else if (selected == (int)previous.x && previous.x != previous.y)
+    {
+        float elapsed = _TransitionTime.x - previous.z;
+        float old = previous.x;
+        previous.x = previous.y;
+        previous.y = old;
+        previous.z = _TransitionTime.x - (_TransitionTime.y - elapsed);
+    }
+    _LodHistory[index] = previous;
+}
+
+[numthreads(64, 1, 1)]
+void UpdateLod(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= (uint)_Count) return;
+    InstanceBounds item = _Bounds[index];
+    if (item.state.x == 0) return;
+    float range = distance(item.lod.xyz, _Camera.xyz);
+    float ratio = item.lod.w * _Lod.x / (_Lod.y > 0 ? 1 : max(range, 0.0001));
+    int selected = SelectLevel(ratio);
+    StoreTransition(index, selected, item.state.z);
+}
+
+[numthreads(64, 1, 1)]
+void UpdateMeshLod(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= (uint)_Count || _Bounds[index].state.x == 0) return;
+    StoreTransition(index, SelectMeshLevel(index, _Part, _MeshLevels, _MeshSelection,
+        _MeshCenter.xyz, _MeshExtents.xyz), _Bounds[index].state.z);
+}
+
+[numthreads(1, 1, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    uint stride = max(2, _BucketStride);
+    for (uint entry = 0; entry < stride; entry++)
+    {
+        _Arguments.Store((_Part * stride + entry) * 20 + 4, 0);
+    }
+}
+
+bool InSplit(float4 sphere, int start, int count)
+{
+    for (int p = start; p < start + count; p++)
+    {
+        float4 plane = _Planes[p];
+        if (dot(plane.xyz, sphere.xyz) + plane.w < -sphere.w) return false;
+    }
+    return true;
+}
+
+bool InView(float4 sphere)
+{
+    bool visible = _SplitCount == 0 ? InSplit(sphere, 0, _PlaneCount) : false;
+    for (int split = 0; split < _SplitCount; split++)
+    {
+        visible = visible || InSplit(sphere, (int)_Splits[split].x, (int)_Splits[split].y);
+    }
+    return visible;
+}
+
+int _BakedOccluderCount;
+float4x4 _BakedOccluders[16];
+
+bool BoxBlocks(float3 origin, float3 end)
+{
+    const float extent = 0.499;
+    if (all(abs(origin) <= extent)) return false;
+    float3 direction = end - origin;
+    float entry = 0;
+    float exit = 1;
+    for (uint axis = 0; axis < 3; axis++)
+    {
+        if (abs(direction[axis]) < 0.000001)
+        {
+            if (abs(origin[axis]) >= extent) return false;
+        }
+        else
+        {
+            float first = (-extent - origin[axis]) / direction[axis];
+            float second = (extent - origin[axis]) / direction[axis];
+            entry = max(entry, min(first, second));
+            exit = min(exit, max(first, second));
+        }
+    }
+    return exit > entry + 0.00001 && entry > 0.00001 && entry < 0.99999;
+}
+
+bool BakedOccluded(float4 sphere)
+{
+    for (int box = 0; box < _BakedOccluderCount; box++)
+    {
+        float3 origin = mul(_BakedOccluders[box], float4(_Camera.xyz, 1)).xyz;
+        bool blocked = true;
+        for (uint corner = 0; corner < 8; corner++)
+        {
+            float3 sign = float3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1) * 2 - 1;
+            float3 end = mul(_BakedOccluders[box], float4(sphere.xyz + sign * sphere.w, 1)).xyz;
+            blocked = blocked && BoxBlocks(origin, end);
+        }
+        if (blocked) return true;
+    }
+    return false;
+}
+
+float4 SelectInstance(InstanceBounds item)
+{
+    if (item.state.x == 0 || item.state.w >= _Quality.x) return 0;
+    float range = distance(item.lod.xyz, _Camera.xyz);
+    if (range - item.sphere.w > _Lod.z || !InView(item.sphere) || BakedOccluded(item.sphere)) return 0;
+    float denominator = _Lod.y > 0 ? 1 : max(range, 0.0001);
+    float diameterPixels = 2 * item.sphere.w * _Lod.x * _Quality.w / denominator;
+    if (diameterPixels < _Quality.y) return 0;
+    if (_Quality.z > 0 && item.state.w >= saturate((_Lod.z - max(0, range - item.sphere.w)) / _Quality.z)) return 0;
+    return float4(1, range, item.lod.w * _Lod.x / denominator, 0);
+}
+
+[numthreads(64, 1, 1)]
+void ResetAll(uint3 id : SV_DispatchThreadID)
+{
+    uint entry = id.x;
+    uint count = (uint)(_PartCount * max(2, _BucketStride));
+    if (entry < count) _Arguments.Store(entry * 20 + 4, 0);
+}
+
+[numthreads(1, 1, 1)]
+void ResetOcclusionStats(uint3 id : SV_DispatchThreadID)
+{
+    _OcclusionStatistics.Store2(0, uint2(0, 0));
+}
+
+Texture2D<float> _OcclusionDepth;
+float4x4 _OcclusionViewProjection;
+float4 _OcclusionSize;
+float _OcclusionBias;
+int _OcclusionFlipY;
+
+bool IsOccluded(float4 sphere)
+{
+    float2 uvMin = 1;
+    float2 uvMax = 0;
+    bool reversed = _OcclusionSize.w > 0;
+    float closest = reversed ? 0 : 1;
+    for (uint corner = 0; corner < 8; corner++)
+    {
+        float3 sign = float3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1) * 2 - 1;
+        float4 clip = mul(_OcclusionViewProjection, float4(sphere.xyz + sign * sphere.w, 1));
+        if (clip.w <= 0.00001) return false;
+        float3 ndc = clip.xyz / clip.w;
+        if (ndc.z < 0 || ndc.z > 1) return false;
+        float2 uv = ndc.xy * 0.5 + 0.5;
+        if (_OcclusionFlipY != 0) uv.y = 1 - uv.y;
+        uvMin = min(uvMin, uv);
+        uvMax = max(uvMax, uv);
+        closest = reversed ? max(closest, ndc.z) : min(closest, ndc.z);
+    }
+    if (any(uvMin < 0) || any(uvMax > 1)) return false;
+    float2 footprint = (uvMax - uvMin) * _OcclusionSize.xy;
+    uint mip = (uint)clamp(ceil(log2(max(1, max(footprint.x, footprint.y)))), 0, _OcclusionSize.z - 1);
+    uint2 size = max(uint2(1, 1), (uint2)_OcclusionSize.xy >> mip);
+    uint2 first = min((uint2)(uvMin * size), size - 1);
+    uint2 last = min((uint2)(uvMax * size), size - 1);
+    float a = _OcclusionDepth.Load(int3(first, mip));
+    float b = _OcclusionDepth.Load(int3(last.x, first.y, mip));
+    float c = _OcclusionDepth.Load(int3(first.x, last.y, mip));
+    float d = _OcclusionDepth.Load(int3(last, mip));
+    float farthest = reversed ? min(min(a, b), min(c, d)) : max(max(a, b), max(c, d));
+    return reversed ? closest + _OcclusionBias < farthest : closest - _OcclusionBias > farthest;
+}
+
+groupshared float3 _ClusterMin[64];
+groupshared float3 _ClusterMax[64];
+groupshared uint _ClusterVisible;
+
+void SelectVisibilityCommon(uint3 id, uint lane, bool useOcclusion)
+{
+    uint dispatchIndex = id.x;
+    bool valid = dispatchIndex < (uint)_Count;
+    uint index = valid && _UseSpatialOrder != 0 ? _SpatialOrder[dispatchIndex] : dispatchIndex;
+    InstanceBounds item = (InstanceBounds)0;
+    if (valid) item = _Bounds[index];
+    if (_SelectionMode > 1)
+    {
+        if (_SelectionMode == 3)
+        {
+            if (lane == 0)
+            {
+                float4 cluster = _Clusters[dispatchIndex / 64];
+                _ClusterVisible = cluster.w >= 0 && InView(cluster) &&
+                    distance(cluster.xyz, _Camera.xyz) - cluster.w <= _Lod.z;
+            }
+        }
+        else
+        {
+            bool active = valid && item.state.x != 0;
+            _ClusterMin[lane] = active ? min(item.sphere.xyz, item.lod.xyz) - item.sphere.w : 1e30;
+            _ClusterMax[lane] = active ? max(item.sphere.xyz, item.lod.xyz) + item.sphere.w : -1e30;
+            GroupMemoryBarrierWithGroupSync();
+            for (uint stride = 32; stride > 0; stride >>= 1)
+            {
+                if (lane < stride)
+                {
+                    _ClusterMin[lane] = min(_ClusterMin[lane], _ClusterMin[lane + stride]);
+                    _ClusterMax[lane] = max(_ClusterMax[lane], _ClusterMax[lane + stride]);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+            if (lane == 0)
+            {
+                float3 center = (_ClusterMin[0] + _ClusterMax[0]) * 0.5;
+                float radius = length((_ClusterMax[0] - _ClusterMin[0]) * 0.5);
+                bool activeCluster = all(_ClusterMin[0] <= _ClusterMax[0]);
+                _Clusters[dispatchIndex / 64] = float4(center, activeCluster ? radius : -1);
+                _ClusterVisible = activeCluster && InView(float4(center, radius)) &&
+                    distance(center, _Camera.xyz) - radius <= _Lod.z;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (valid && _ClusterVisible == 0)
+        {
+            _Selection[index] = 0;
+            return;
+        }
+    }
+    if (valid)
+    {
+        float4 selection = SelectInstance(item);
+        if (useOcclusion && selection.x != 0)
+        {
+            uint ignored;
+            if (_MeasureOcclusion != 0) _OcclusionStatistics.InterlockedAdd(0, 1, ignored);
+            if (IsOccluded(item.sphere))
+            {
+                selection = 0;
+            }
+            else if (_MeasureOcclusion != 0)
+            {
+                _OcclusionStatistics.InterlockedAdd(4, 1, ignored);
+            }
+        }
+        _Selection[index] = selection;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void SelectVisibility(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
+{
+    SelectVisibilityCommon(id, lane, false);
+}
+
+[numthreads(64, 1, 1)]
+void SelectVisibilityOcclusion(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
+{
+    SelectVisibilityCommon(id, lane, true);
+}
+
+void CullPart(uint index, uint part, int partLod, int partFlip, int meshLevel, int meshLevels,
+    float4 meshSelection, float3 meshCenter, float3 meshExtents, bool meshFadeEnabled)
+{
+    InstanceBounds item = _Bounds[index];
+    float4 selection = _SelectionMode > 0 ? _Selection[index] : SelectInstance(item);
+    if (selection.x == 0) return;
+    float ratio = selection.z;
+    int selected = _LodCount;
+    for (int level = 0; level < _LodCount; level++)
+    {
+        if (ratio >= _Thresholds[(uint)level >> 2][(uint)level & 3])
+        {
+            selected = level;
+            break;
+        }
+    }
+    if (selected == _LodCount && _AnimatedFade == 0) return;
+    int minimumLod = min((int)_Lod.w, _LodCount - 1);
+    float fade = 1;
+    int target = selected + 1;
+    float width = selected < _LodCount ? _FadeWidths[(uint)selected >> 2][(uint)selected & 3] : 0;
+    if (_CrossFade != 0 && width > 0)
+    {
+        float threshold = _Thresholds[(uint)selected >> 2][(uint)selected & 3];
+        fade = threshold <= 0 ? 1 : saturate((ratio - threshold) * (threshold + width) / max(ratio * width, 0.000001));
+    }
+    if (_AnimatedFade != 0)
+    {
+        float4 transition = _LodHistory[index];
+        selected = (int)transition.x;
+        target = (int)transition.y;
+        fade = selected == target ? 1 : 1 - saturate((_TransitionTime.x - transition.z) / _TransitionTime.y);
+    }
+    selected = max(selected, minimumLod);
+    target = max(target, minimumLod);
+    if (selected == target) fade = 1;
+    float signedFade = 1;
+    bool percentage = selected < _PercentageLods;
+    if (percentage)
+    {
+        if (partLod != selected) return;
+        float upper = _Thresholds[(uint)selected >> 2][(uint)selected & 3];
+        float lower = selected == 0 ? 1 : _Thresholds[(uint)(selected - 1) >> 2][(uint)(selected - 1) & 3];
+        float start = 1 / max(lower, 0.000001);
+        float end = 1 / max(upper, 0.000001);
+        signedFade = saturate((1 / max(ratio, 0.000001) - start) / max(end - start, 0.000001));
+    }
+    else if (partLod == selected)
+    {
+        if (fade <= 0) return;
+        signedFade = fade;
+    }
+    else if (_CrossFade != 0 && partLod == target && fade < 1)
+    {
+        signedFade = -max(fade, 1.0 / 127);
+    }
+    else return;
+    if (meshLevels > 1)
+    {
+        int selectedMesh = SelectMeshLevel(index, part, meshLevels, meshSelection, meshCenter, meshExtents);
+        if (meshFadeEnabled && signedFade == 1 && !percentage)
+        {
+            float4 transition = _MeshHistory[index];
+            float meshFade = transition.x == transition.y ? 1 : 1 - saturate((_TransitionTime.x - transition.z) / _TransitionTime.y);
+            if (meshLevel == (int)transition.x && meshFade > 0) signedFade = meshFade;
+            else if (meshLevel == (int)transition.y && meshFade < 1) signedFade = -max(meshFade, 1.0 / 127);
+            else return;
+        }
+        else if (selectedMesh != meshLevel) return;
+    }
+    bool packedFade = percentage || signedFade < 1;
+    uint stride = max(2, _BucketStride);
+    uint bucket = part * stride + ((uint)item.state.y ^ (uint)partFlip);
+    if (stride > 2 && packedFade) bucket += 2;
+    uint offset;
+    _Arguments.InterlockedAdd(bucket * 20 + 4, 1, offset);
+    uint packed = index;
+    if ((_CrossFade != 0 || meshFadeEnabled) && (stride == 2 || packedFade))
+    {
+        int fadeByte = (int)floor(signedFade * 127 + 0.5);
+        fadeByte = signedFade < 0 ? min(-1, fadeByte) : max(1, fadeByte);
+        packed |= ((uint)fadeByte & 255) << 24;
+    }
+    _Visible.Store((bucket * _Capacity + offset) * 4, packed);
+}
+
+[numthreads(64, 1, 1)]
+void Cull(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= (uint)_Count) return;
+    CullPart(index, _Part, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
+        _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0);
+}
+
+[numthreads(64, 1, 1)]
+void CullParts(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    uint part = id.y;
+    if (index >= (uint)_Count || part >= (uint)_PartCount) return;
+    PartCullData data = _PartParameters[part];
+    CullPart(index, part, (int)data.header.x, (int)data.header.y, (int)data.header.z,
+        (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false);
+}
+
+[numthreads(64, 1, 1)]
+void ApplyOcclusion(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Count || _Selection[id.x].x == 0) return;
+    if (IsOccluded(_Bounds[id.x].sphere)) _Selection[id.x] = 0;
+}

@@ -1,0 +1,27 @@
+{
+  "name": "LoogaSoft.Instancing.Splines.EditorTests",
+  "references": [
+    "LoogaSoft.Instancing",
+    "LoogaSoft.Instancing.Splines",
+    "Unity.Splines",
+    "Unity.Mathematics"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "autoReferenced": false,
+  "defineConstraints": [
+    "UNITY_INCLUDE_TESTS",
+    "LOOGA_INSTANCING_SPLINES"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.splines",
+      "expression": "2.0.0",
+      "define": "LOOGA_INSTANCING_SPLINES"
+    }
+  ]
+}

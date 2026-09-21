@@ -1,0 +1,27 @@
+#pragma kernel Reduce
+#pragma target 5.0
+Texture2D<float> _Source;
+RWTexture2D<float> _Destination;
+float4 _ReductionSize;
+int _SourceMip;
+int _Reversed;
+
+[numthreads(8, 8, 1)]
+void Reduce(uint3 id : SV_DispatchThreadID)
+{
+    int2 _SourceSize = (int2)_ReductionSize.xy;
+    int2 _DestinationSize = (int2)_ReductionSize.zw;
+    if (any(id.xy >= (uint2)_DestinationSize)) return;
+    int2 first = int2(floor((float2)id.xy * _SourceSize / _DestinationSize));
+    int2 last = min(_SourceSize, int2(ceil((float2)(id.xy + 1) * _SourceSize / _DestinationSize)));
+    float farthest = _Reversed != 0 ? 1 : 0;
+    for (int y = first.y; y < last.y; y++)
+    {
+        for (int x = first.x; x < last.x; x++)
+        {
+            float depth = _Source.Load(int3(x, y, _SourceMip));
+            farthest = _Reversed != 0 ? min(farthest, depth) : max(farthest, depth);
+        }
+    }
+    _Destination[id.xy] = farthest;
+}

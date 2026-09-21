@@ -1,0 +1,19 @@
+{
+  "name": "LoogaSoft.Instancing.Splines",
+  "references": [
+    "LoogaSoft.Instancing",
+    "Unity.Splines",
+    "Unity.Mathematics"
+  ],
+  "defineConstraints": [
+    "LOOGA_INSTANCING_SPLINES"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.splines",
+      "expression": "2.0.0",
+      "define": "LOOGA_INSTANCING_SPLINES"
+    }
+  ],
+  "autoReferenced": true
+}

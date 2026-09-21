@@ -1,0 +1,12 @@
+{
+  "name": "LoogaSoft.Instancing",
+  "rootNamespace": "LoogaSoft.Instancing",
+  "references": [
+    "Unity.Collections",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.Burst",
+    "Unity.Mathematics"
+  ],
+  "allowUnsafeCode": true,
+  "autoReferenced": true
+}

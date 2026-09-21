@@ -1,0 +1,17 @@
+{
+  "name": "com.loogasoft.loogainstancing",
+  "version": "0.1.0-preview.12",
+  "displayName": "Looga Instancing",
+  "description": "Shared BRG mesh rendering, authoring, instance streaming and interaction for Looga products.",
+  "unity": "6000.3",
+  "dependencies": {
+    "com.unity.render-pipelines.core": "17.3.0",
+    "com.unity.burst": "1.8.30",
+    "com.unity.collections": "2.6.8",
+    "com.unity.mathematics": "1.3.3",
+    "com.unity.modules.physics": "1.0.0",
+    "com.unity.modules.assetbundle": "1.0.0",
+    "com.unity.modules.jsonserialize": "1.0.0",
+    "com.unity.modules.wind": "1.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "LoogaSoft.Instancing.SpeedTree",
+  "references": [
+    "LoogaSoft.Instancing",
+    "Unity.RenderPipelines.GPUDriven.Runtime",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.Collections"
+  ],
+  "autoReferenced": true
+}

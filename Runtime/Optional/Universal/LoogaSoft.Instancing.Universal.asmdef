@@ -1,0 +1,19 @@
+{
+  "name": "LoogaSoft.Instancing.Universal",
+  "references": [
+    "LoogaSoft.Instancing",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.RenderPipelines.Universal.Runtime"
+  ],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "LOOGA_INSTANCING_URP"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.render-pipelines.universal",
+      "expression": "17.3.0",
+      "define": "LOOGA_INSTANCING_URP"
+    }
+  ]
+}

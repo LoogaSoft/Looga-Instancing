@@ -1,0 +1,11 @@
+{
+  "name": "LoogaSoft.Instancing.Editor",
+  "rootNamespace": "LoogaSoft.Instancing.Editor",
+  "references": [
+    "LoogaSoft.Instancing"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}
