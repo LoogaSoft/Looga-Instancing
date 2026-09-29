@@ -49,6 +49,27 @@ namespace LoogaSoft.Terrain.Instances.Tests
                 VegetationInteractor.Publish();
             }
         }
+        [Test]
+        public void WindFieldPublishesGustWavesAndReleasesThemOnDisable()
+        {
+            var root = new GameObject("Wind field fixture");
+            try
+            {
+                var field = root.AddComponent<VegetationWindField>();
+                field.ConfigureWaves(30, 0.4f);
+                Assert.AreEqual(new Vector4(30, 0.4f, 0, 0), Shader.GetGlobalVector("_LoogaFieldWave"));
+                field.ConfigureWaves(0, 2);
+                Assert.AreEqual(new Vector4(1, 1, 0, 0), Shader.GetGlobalVector("_LoogaFieldWave"));
+                Assert.Throws<System.ArgumentException>(() => field.ConfigureWaves(float.NaN, 0.5f));
+                field.enabled = false;
+                Assert.AreEqual(Vector4.zero, Shader.GetGlobalVector("_LoogaFieldWave"));
+            }
+            finally
+            {
+                Object.DestroyImmediate(root);
+            }
+        }
+
         private static IEnumerator NextEditorUpdate()
         {
             bool advanced = false;

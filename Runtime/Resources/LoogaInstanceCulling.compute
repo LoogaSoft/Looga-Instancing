@@ -1,4 +1,4 @@
-#pragma kernel ApplyOcclusion
+﻿#pragma kernel ApplyOcclusion
 #pragma kernel SelectVisibility
 #pragma kernel SelectVisibilityOcclusion
 #pragma kernel ResetOcclusionStats
@@ -6,9 +6,12 @@
 #pragma kernel ResetAll
 #pragma kernel Cull
 #pragma kernel CullParts
+#pragma kernel CullGrouped
+#pragma kernel CullPartsGrouped
 #pragma kernel UpdateLod
 #pragma kernel UpdateMeshLod
 #pragma kernel PatchRawBuffer
+#pragma kernel ClearHistory
 #pragma target 5.0
 
 ByteAddressBuffer _PatchSource;
@@ -42,10 +45,13 @@ int _SelectionMode;
 int _UseSpatialOrder;
 int _MeasureOcclusion;
 float4 _Quality; // Density, minimum projected pixels, shadow fade distance, viewport height.
+float4 _ViewFade; // Camera range, fade width, density falloff start, far density.
+int _PartMaterialFade;
 int _Count;
 int _Capacity;
 int _BucketStride;
 int _Part;
+int _PartData; // Shared instance data block of the current draw part.
 int _PartCount;
 int _PlaneCount;
 int _SplitCount;
@@ -75,16 +81,16 @@ struct PartCullData
 {
     float4 header; // LOD, winding flip, mesh level, mesh level count.
     float4 selection;
-    float4 center;
+    float4 center; // xyz: mesh bounds center. w: shared instance data block.
     float4 extents;
 };
 StructuredBuffer<PartCullData> _PartParameters;
 
-int SelectMeshLevel(uint index, uint part, int meshLevels, float4 meshSelection,
+int SelectMeshLevel(uint index, uint dataPart, int meshLevels, float4 meshSelection,
     float3 meshCenter, float3 meshExtents)
 {
     if (meshSelection.w >= 0) return clamp((int)meshSelection.w, 0, meshLevels - 1);
-    uint address = 64 + (part * _Capacity + index) * 48;
+    uint address = 64 + (dataPart * _Capacity + index) * 48;
     float3 x = asfloat(_InstanceData.Load3(address));
     float3 y = asfloat(_InstanceData.Load3(address + 12));
     float3 z = asfloat(_InstanceData.Load3(address + 24));
@@ -153,7 +159,7 @@ void UpdateMeshLod(uint3 id : SV_DispatchThreadID)
 {
     uint index = id.x;
     if (index >= (uint)_Count || _Bounds[index].state.x == 0) return;
-    StoreTransition(index, SelectMeshLevel(index, _Part, _MeshLevels, _MeshSelection,
+    StoreTransition(index, SelectMeshLevel(index, _PartData, _MeshLevels, _MeshSelection,
         _MeshCenter.xyz, _MeshExtents.xyz), _Bounds[index].state.z);
 }
 
@@ -236,6 +242,12 @@ float4 SelectInstance(InstanceBounds item)
     if (item.state.x == 0 || item.state.w >= _Quality.x) return 0;
     float range = distance(item.lod.xyz, _Camera.xyz);
     if (range - item.sphere.w > _Lod.z || !InView(item.sphere) || BakedOccluded(item.sphere)) return 0;
+    // Stable distance thinning. Full density before the falloff start, then linear to the far density at the view limit.
+    if (_ViewFade.z > 0)
+    {
+        float falloff = saturate((range - _ViewFade.z) / max(_ViewFade.x - _ViewFade.z, 0.001));
+        if (item.state.w >= _Quality.x * lerp(1, _ViewFade.w, falloff)) return 0;
+    }
     float denominator = _Lod.y > 0 ? 1 : max(range, 0.0001);
     float diameterPixels = 2 * item.sphere.w * _Lod.x * _Quality.w / denominator;
     if (diameterPixels < _Quality.y) return 0;
@@ -382,12 +394,18 @@ void SelectVisibilityOcclusion(uint3 id : SV_DispatchThreadID, uint lane : SV_Gr
     SelectVisibilityCommon(id, lane, true);
 }
 
-void CullPart(uint index, uint part, int partLod, int partFlip, int meshLevel, int meshLevels,
-    float4 meshSelection, float3 meshCenter, float3 meshExtents, bool meshFadeEnabled)
+bool CullPart(uint index, uint part, uint dataPart, int partLod, int partFlip, int meshLevel, int meshLevels,
+    float4 meshSelection, float3 meshCenter, float3 meshExtents, bool meshFadeEnabled,
+    bool materialViewFade, out uint bucket, out uint packed)
 {
+    bucket = 0;
+    packed = 0;
     InstanceBounds item = _Bounds[index];
     float4 selection = _SelectionMode > 0 ? _Selection[index] : SelectInstance(item);
-    if (selection.x == 0) return;
+    if (selection.x == 0) return false;
+    if (_ViewFade.y > 0 && !materialViewFade &&
+        item.state.w / max(_Quality.x, 0.000001) >=
+        saturate((_ViewFade.x - max(0, selection.y - item.sphere.w)) / _ViewFade.y)) return false;
     float ratio = selection.z;
     int selected = _LodCount;
     for (int level = 0; level < _LodCount; level++)
@@ -398,7 +416,7 @@ void CullPart(uint index, uint part, int partLod, int partFlip, int meshLevel, i
             break;
         }
     }
-    if (selected == _LodCount && _AnimatedFade == 0) return;
+    if (selected == _LodCount && _AnimatedFade == 0) return false;
     int minimumLod = min((int)_Lod.w, _LodCount - 1);
     float fade = 1;
     int target = selected + 1;
@@ -422,7 +440,7 @@ void CullPart(uint index, uint part, int partLod, int partFlip, int meshLevel, i
     bool percentage = selected < _PercentageLods;
     if (percentage)
     {
-        if (partLod != selected) return;
+        if (partLod != selected) return false;
         float upper = _Thresholds[(uint)selected >> 2][(uint)selected & 3];
         float lower = selected == 0 ? 1 : _Thresholds[(uint)(selected - 1) >> 2][(uint)(selected - 1) & 3];
         float start = 1 / max(lower, 0.000001);
@@ -431,40 +449,45 @@ void CullPart(uint index, uint part, int partLod, int partFlip, int meshLevel, i
     }
     else if (partLod == selected)
     {
-        if (fade <= 0) return;
+        if (fade <= 0) return false;
         signedFade = fade;
     }
     else if (_CrossFade != 0 && partLod == target && fade < 1)
     {
         signedFade = -max(fade, 1.0 / 127);
     }
-    else return;
+    else return false;
     if (meshLevels > 1)
     {
-        int selectedMesh = SelectMeshLevel(index, part, meshLevels, meshSelection, meshCenter, meshExtents);
+        int selectedMesh = SelectMeshLevel(index, dataPart, meshLevels, meshSelection, meshCenter, meshExtents);
         if (meshFadeEnabled && signedFade == 1 && !percentage)
         {
             float4 transition = _MeshHistory[index];
             float meshFade = transition.x == transition.y ? 1 : 1 - saturate((_TransitionTime.x - transition.z) / _TransitionTime.y);
             if (meshLevel == (int)transition.x && meshFade > 0) signedFade = meshFade;
             else if (meshLevel == (int)transition.y && meshFade < 1) signedFade = -max(meshFade, 1.0 / 127);
-            else return;
+            else return false;
         }
-        else if (selectedMesh != meshLevel) return;
+        else if (selectedMesh != meshLevel) return false;
     }
     bool packedFade = percentage || signedFade < 1;
     uint stride = max(2, _BucketStride);
-    uint bucket = part * stride + ((uint)item.state.y ^ (uint)partFlip);
+    bucket = part * stride + ((uint)item.state.y ^ (uint)partFlip);
     if (stride > 2 && packedFade) bucket += 2;
-    uint offset;
-    _Arguments.InterlockedAdd(bucket * 20 + 4, 1, offset);
-    uint packed = index;
+    packed = index;
     if ((_CrossFade != 0 || meshFadeEnabled) && (stride == 2 || packedFade))
     {
         int fadeByte = (int)floor(signedFade * 127 + 0.5);
         fadeByte = signedFade < 0 ? min(-1, fadeByte) : max(1, fadeByte);
         packed |= ((uint)fadeByte & 255) << 24;
     }
+    return true;
+}
+
+void AppendVisible(uint bucket, uint packed)
+{
+    uint offset;
+    _Arguments.InterlockedAdd(bucket * 20 + 4, 1, offset);
     _Visible.Store((bucket * _Capacity + offset) * 4, packed);
 }
 
@@ -473,8 +496,10 @@ void Cull(uint3 id : SV_DispatchThreadID)
 {
     uint index = id.x;
     if (index >= (uint)_Count) return;
-    CullPart(index, _Part, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
-        _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0);
+    uint bucket, packed;
+    if (CullPart(index, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
+        _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
+        _PartMaterialFade != 0, bucket, packed)) AppendVisible(bucket, packed);
 }
 
 [numthreads(64, 1, 1)]
@@ -484,8 +509,69 @@ void CullParts(uint3 id : SV_DispatchThreadID)
     uint part = id.y;
     if (index >= (uint)_Count || part >= (uint)_PartCount) return;
     PartCullData data = _PartParameters[part];
-    CullPart(index, part, (int)data.header.x, (int)data.header.y, (int)data.header.z,
-        (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false);
+    uint bucket, packed;
+    if (CullPart(index, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
+        (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
+        bucket, packed)) AppendVisible(bucket, packed);
+}
+
+groupshared uint _GroupCounts[4];
+groupshared uint _GroupBases[4];
+
+void AppendVisibleGroup(bool visible, uint part, uint bucket, uint packed, uint lane)
+{
+    uint stride = max(2, _BucketStride);
+    if (lane < stride) _GroupCounts[lane] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint localBucket = visible ? bucket - part * stride : 0;
+    uint localOffset = 0;
+    if (visible) InterlockedAdd(_GroupCounts[localBucket], 1, localOffset);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < stride)
+    {
+        uint baseOffset = 0;
+        uint count = _GroupCounts[lane];
+        if (count > 0) _Arguments.InterlockedAdd((part * stride + lane) * 20 + 4, count, baseOffset);
+        _GroupBases[lane] = baseOffset;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (visible)
+    {
+        _Visible.Store((bucket * _Capacity + _GroupBases[localBucket] + localOffset) * 4, packed);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CullGrouped(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
+{
+    uint bucket = 0, packed = 0;
+    bool visible = false;
+    if (id.x < (uint)_Count)
+    {
+        visible = CullPart(id.x, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
+            _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
+            _PartMaterialFade != 0, bucket, packed);
+    }
+    AppendVisibleGroup(visible, (uint)_Part, bucket, packed, lane);
+}
+
+[numthreads(64, 1, 1)]
+void CullPartsGrouped(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
+{
+    uint part = id.y;
+    uint bucket = 0, packed = 0;
+    bool visible = false;
+    if (id.x < (uint)_Count && part < (uint)_PartCount)
+    {
+        PartCullData data = _PartParameters[part];
+        visible = CullPart(id.x, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
+            (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
+            bucket, packed);
+    }
+    AppendVisibleGroup(visible, part, bucket, packed, lane);
 }
 
 [numthreads(64, 1, 1)]
@@ -493,4 +579,13 @@ void ApplyOcclusion(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= (uint)_Count || _Selection[id.x].x == 0) return;
     if (IsOccluded(_Bounds[id.x].sphere)) _Selection[id.x] = 0;
+}
+
+int _ClearCount;
+
+// Clears a LOD transition history on the GPU, so a history cut does not upload a population-sized buffer.
+[numthreads(64, 1, 1)]
+void ClearHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < (uint)_ClearCount) _LodHistory[id.x] = 0;
 }

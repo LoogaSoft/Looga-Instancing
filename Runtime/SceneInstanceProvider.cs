@@ -14,10 +14,15 @@ namespace LoogaSoft.Instancing
         [SerializeField] private InstanceMaterialProfile _materialProfile;
         [SerializeField, Min(1)] private float _maxDistance = 1000;
         [SerializeField] private string _worldSourceId = Guid.NewGuid().ToString("N");
+        [SerializeField, Tooltip("Check every source each frame for movement and for hierarchy, material and LOD " +
+            "changes. Turn off for static sources whose owner reconfigures the provider after each change.")]
+        private bool _trackSourceChanges = true;
         private readonly List<InstancePrototype> _prototypes = new List<InstancePrototype>();
         private readonly List<Entry> _entries = new List<Entry>();
         private readonly Dictionary<int, InstanceRenderer> _renderers = new Dictionary<int, InstanceRenderer>();
         private readonly List<MeshRenderer> _scan = new List<MeshRenderer>();
+        private readonly HashSet<Transform> _sourceSet = new HashSet<Transform>();
+        private readonly HashSet<Transform> _nestedSources = new HashSet<Transform>();
         private readonly List<Material> _materials = new List<Material>();
         private bool _rebuildRequested;
         private static readonly HashSet<MeshRenderer> _owners = new HashSet<MeshRenderer>();
@@ -30,6 +35,17 @@ namespace LoogaSoft.Instancing
         public string Diagnostic { get; private set; }
         /// <summary>Warnings for renderers or components that remain on their native path.</summary>
         public string CompatibilityReport { get; private set; }
+        /// <summary>
+        /// When true, Synchronize checks every source each frame and rebuilds after a change. The check reads the
+        /// hierarchy, transforms and material hashes of every source, so its cost grows with the population.
+        /// When false, the provider changes only on Configure or Rebuild. Use false for static populations whose owner
+        /// reconfigures the provider after each change, such as generated object outputs.
+        /// </summary>
+        public bool TrackSourceChanges
+        {
+            get => _trackSourceChanges;
+            set => _trackSourceChanges = value;
+        }
         /// <summary>Current mixed Looga/native ownership for configured active scene roots.</summary>
         public InstanceSourceAdapterStatus SourceStatus
         {
@@ -130,6 +146,8 @@ namespace LoogaSoft.Instancing
                 Rebuild();
                 return;
             }
+            // Static sources: the owner calls Configure or Rebuild after a change.
+            if (!_trackSourceChanges) return;
             int active = 0;
             foreach (var root in _sources)
             {
@@ -180,6 +198,7 @@ namespace LoogaSoft.Instancing
             CompatibilityReport = null;
             _rebuildRequested = false;
             if (!isActiveAndEnabled) return;
+            FindNestedSources();
             foreach (var root in _sources)
             {
                 if (!root || !root.activeInHierarchy)
@@ -248,6 +267,28 @@ namespace LoogaSoft.Instancing
             }
         }
 
+        // Marks both roots of every nested pair. Each source walks its ancestors once, so the cost grows with the
+        // source count times the hierarchy depth. A pairwise IsChildOf check took over a minute for 10,000 roots.
+        private void FindNestedSources()
+        {
+            _nestedSources.Clear();
+            _sourceSet.Clear();
+            foreach (var source in _sources)
+            {
+                if (source) _sourceSet.Add(source.transform);
+            }
+            foreach (var source in _sources)
+            {
+                if (!source) continue;
+                for (Transform ancestor = source.transform.parent; ancestor; ancestor = ancestor.parent)
+                {
+                    if (!_sourceSet.Contains(ancestor)) continue;
+                    _nestedSources.Add(source.transform);
+                    _nestedSources.Add(ancestor);
+                }
+            }
+        }
+
         private void ValidateRoot(GameObject root)
         {
 #if UNITY_EDITOR
@@ -260,12 +301,9 @@ namespace LoogaSoft.Instancing
             {
                 throw new NotSupportedException("Use a loaded scene object.");
             }
-            foreach (var other in _sources)
+            if (_nestedSources.Contains(root.transform))
             {
-                if (other && other != root && (root.transform.IsChildOf(other.transform) || other.transform.IsChildOf(root.transform)))
-                {
-                    throw new NotSupportedException("Nested source roots overlap.");
-                }
+                throw new NotSupportedException("Nested source roots overlap.");
             }
             root.GetComponentsInChildren(true, _scan);
             foreach (var source in _scan)

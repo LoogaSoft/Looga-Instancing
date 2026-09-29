@@ -72,6 +72,76 @@ namespace LoogaSoft.Terrain.Instances.Tests
         }
 
         [Test]
+        public void RotatedAndScaledCopiesWithChildMeshesShareOneDrawPrototype()
+        {
+            // Scattered copies of one prefab: a root with an offset child mesh, each with its own rotation and scale.
+            var roots = new GameObject[4];
+            try
+            {
+                for (int index = 0; index < roots.Length; index++)
+                {
+                    roots[index] = new GameObject("Scattered root " + index);
+                    GameObject child = Object.Instantiate(_source, roots[index].transform);
+                    child.transform.localPosition = new Vector3(0.3f, 1.1f, -0.2f);
+                    child.transform.localRotation = Quaternion.Euler(10f, 20f, 0f);
+                    roots[index].transform.SetPositionAndRotation(new Vector3(index * 17.3f, 3.7f, index * -9.1f),
+                        Quaternion.Euler(index * 11.7f, index * 73.9f, index * 5.3f));
+                    roots[index].transform.localScale = Vector3.one * (0.83f + index * 0.61f);
+                }
+                _provider.Configure(Array.ConvertAll(roots, root => root.transform.GetChild(0).gameObject));
+                Assert.AreEqual(roots.Length, _provider.ActiveSourceCount, _provider.Diagnostic);
+                Assert.AreEqual(1, _provider.PrototypeCount);
+
+                _provider.Configure(roots);
+                Assert.AreEqual(roots.Length, _provider.ActiveSourceCount, _provider.Diagnostic);
+                Assert.AreEqual(1, _provider.PrototypeCount);
+            }
+            finally
+            {
+                _provider.enabled = false;
+                foreach (GameObject root in roots)
+                {
+                    if (root) Object.DestroyImmediate(root);
+                }
+            }
+        }
+
+        [Test]
+        public void NestedRootsStayNativeAndOtherRootsDraw()
+        {
+            GameObject parent = Object.Instantiate(_source);
+            GameObject child = Object.Instantiate(_source, parent.transform);
+            try
+            {
+                _provider.Configure(new[] { parent, child, _source });
+                Assert.AreEqual(1, _provider.ActiveSourceCount);
+                StringAssert.Contains("Nested source roots overlap.", _provider.Diagnostic);
+                Assert.IsTrue(_source.GetComponent<Renderer>().forceRenderingOff);
+                Assert.IsFalse(parent.GetComponent<Renderer>().forceRenderingOff);
+                Assert.IsFalse(child.GetComponent<Renderer>().forceRenderingOff);
+            }
+            finally
+            {
+                _provider.enabled = false;
+                Object.DestroyImmediate(parent);
+            }
+        }
+
+        [Test]
+        public void StaticSourcesSkipChangeChecksUntilRebuild()
+        {
+            _provider.TrackSourceChanges = false;
+            _provider.Configure(new[] { _source });
+            Assert.AreEqual(1, _provider.ActiveSourceCount, _provider.Diagnostic);
+            _material.renderQueue = 3000;
+            _provider.Synchronize();
+            Assert.AreEqual(1, _provider.ActiveSourceCount);
+            _provider.Rebuild();
+            Assert.AreEqual(0, _provider.ActiveSourceCount);
+            Assert.IsFalse(_source.GetComponent<Renderer>().forceRenderingOff);
+        }
+
+        [Test]
         public void UnsupportedMaterialChangeRestoresNativeRendering()
         {
             _provider.Configure(new[] { _source });

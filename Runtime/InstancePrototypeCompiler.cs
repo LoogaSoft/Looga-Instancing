@@ -238,7 +238,7 @@ namespace LoogaSoft.Instancing
                         analysis.HasWind = true;
                     }
                 }
-                Append(signature, source.transform.worldToLocalMatrix * meshRenderer.transform.localToWorldMatrix);
+                Append(signature, InstancePrototype.RelativeMatrix(source.transform, meshRenderer.transform));
                 Append(signature, (int)meshRenderer.shadowCastingMode);
                 Append(signature, meshRenderer.receiveShadows ? 1 : 0);
                 Append(signature, unchecked((int)meshRenderer.renderingLayerMask));

@@ -110,6 +110,17 @@ namespace LoogaSoft.Instancing
             return (Placement[])_resolved.Clone();
         }
 
+        /// <summary>Current gameplay-resolved data without a copy. Callers must not change the array.</summary>
+        /// <remarks>Each placement change assigns a new array. Callers can compare references to detect changes.</remarks>
+        internal Placement[] ResolvedPlacements
+        {
+            get
+            {
+                EnsureData();
+                return _resolved;
+            }
+        }
+
         /// <summary>Find gameplay-resolved data. Removed instances return false.</summary>
         public bool TryGetResolvedPlacement(string id, out Placement placement)
         {

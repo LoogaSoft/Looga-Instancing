@@ -21,6 +21,9 @@ namespace LoogaSoft.Instancing
         private readonly HashSet<string> _retained = new(StringComparer.Ordinal);
         private GameObject _owner;
         private bool _validated;
+        private InstanceContainer.Placement[] _boundsSource;
+        private Matrix4x4 _boundsMatrix;
+        private Bounds _pivotBounds;
         private struct Candidate
         {
             internal InstanceContainer.Placement Placement;
@@ -84,9 +87,17 @@ namespace LoogaSoft.Instancing
                 ValidatePrototype();
                 _validated = true;
             }
+            InstanceContainer.Placement[] placements = _source.ResolvedPlacements;
+            // Skip the per-placement scan when no interest can reach this container and no proxy needs release.
+            if (_proxies.Count == 0 && !InterestReachesPlacements(placements))
+            {
+                PendingCount = 0;
+                Diagnostic = null;
+                return;
+            }
             _wanted.Clear();
             _retained.Clear();
-            foreach (var placement in _source.CopyResolvedPlacements())
+            foreach (var placement in placements)
             {
                 Vector3 position = _source.transform.TransformPoint(placement.Position);
                 float nearest = float.PositiveInfinity;
@@ -153,6 +164,35 @@ namespace LoogaSoft.Instancing
             }
             PendingCount = _wanted.Count - _proxies.Count;
             Diagnostic = _wanted.Count > _maximumProxies ? "Gameplay collider demand exceeds capacity. Increase Maximum Proxies or reduce the interest regions." : null;
+        }
+
+        private bool InterestReachesPlacements(InstanceContainer.Placement[] placements)
+        {
+            if (placements.Length == 0) return false;
+            Matrix4x4 world = _source.transform.localToWorldMatrix;
+            if (placements != _boundsSource || world != _boundsMatrix)
+            {
+                // The residency test uses pivot distance, so pivot bounds give an exact rejection.
+                _pivotBounds = new Bounds(world.MultiplyPoint3x4(placements[0].Position), Vector3.zero);
+                for (int i = 1; i < placements.Length; i++)
+                {
+                    _pivotBounds.Encapsulate(world.MultiplyPoint3x4(placements[i].Position));
+                }
+                _boundsSource = placements;
+                _boundsMatrix = world;
+            }
+            foreach (var interest in _interests)
+            {
+                if (!interest || !interest.isActiveAndEnabled)
+                {
+                    continue;
+                }
+                if (_pivotBounds.SqrDistance(interest.transform.position) <= interest.Radius * interest.Radius)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void ValidatePrototype()

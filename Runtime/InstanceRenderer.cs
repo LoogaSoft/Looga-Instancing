@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -27,16 +30,172 @@ namespace LoogaSoft.Instancing
         }
     }
 
+    // URP drains queued culling work after context.Cull and before shadow drawing.
+    internal static class InstanceCullScheduler
+    {
+        private readonly struct Pending
+        {
+            internal readonly InstanceRenderer Owner;
+            internal readonly object Feature;
+            internal readonly Camera Camera;
+            internal readonly ScriptableRenderContext Context;
+            internal readonly CommandBuffer Commands;
+
+            internal Pending(InstanceRenderer owner, object feature, Camera camera,
+                ScriptableRenderContext context, CommandBuffer commands)
+            {
+                Owner = owner;
+                Feature = feature;
+                Camera = camera;
+                Context = context;
+                Commands = commands;
+            }
+        }
+
+        private static readonly object Gate = new();
+        private static readonly Dictionary<Camera, object> ActiveCameras = new();
+        private static readonly List<Pending> Work = new();
+
+        internal static void Begin(Camera camera, object feature)
+        {
+            if (!camera || feature == null) return;
+            Cancel(camera);
+            lock (Gate) ActiveCameras[camera] = feature;
+        }
+
+        internal static bool TryQueue(InstanceRenderer owner, Camera camera,
+            ScriptableRenderContext context, CommandBuffer commands)
+        {
+            if (owner == null || !camera || commands == null) return false;
+            lock (Gate)
+            {
+                if (!ActiveCameras.TryGetValue(camera, out object feature)) return false;
+                Work.Add(new Pending(owner, feature, camera, context, commands));
+                return true;
+            }
+        }
+
+        internal static int Flush(Camera camera, object feature)
+        {
+            return Drain(camera, feature, static (context, commands) => context.ExecuteCommandBuffer(commands));
+        }
+
+        internal static int Drain(Camera camera, object feature,
+            Action<ScriptableRenderContext, CommandBuffer> execute)
+        {
+            if (execute == null) throw new ArgumentNullException(nameof(execute));
+            List<Pending> ready = Take(camera, feature);
+            Exception failure = null;
+            foreach (Pending pending in ready)
+            {
+                try
+                {
+                    execute(pending.Context, pending.Commands);
+                }
+                catch (Exception exception)
+                {
+                    failure ??= exception;
+                }
+                finally
+                {
+                    CommandBufferPool.Release(pending.Commands);
+                }
+            }
+            if (failure != null) throw failure;
+            return ready.Count;
+        }
+
+        internal static int Cancel(Camera camera)
+        {
+            return Release(Take(camera, null));
+        }
+
+        internal static int CancelOwner(InstanceRenderer owner)
+        {
+            if (owner == null) return 0;
+            return Release(Remove(pending => ReferenceEquals(pending.Owner, owner)));
+        }
+
+        internal static int CancelFeature(object feature)
+        {
+            if (feature == null) return 0;
+            List<Pending> abandoned;
+            lock (Gate)
+            {
+                var cameras = new List<Camera>();
+                foreach (var pair in ActiveCameras)
+                {
+                    if (ReferenceEquals(pair.Value, feature)) cameras.Add(pair.Key);
+                }
+                foreach (Camera camera in cameras) ActiveCameras.Remove(camera);
+                abandoned = RemoveLocked(pending => ReferenceEquals(pending.Feature, feature));
+            }
+            return Release(abandoned);
+        }
+
+        private static int Release(List<Pending> abandoned)
+        {
+            foreach (Pending pending in abandoned)
+            {
+                CommandBufferPool.Release(pending.Commands);
+            }
+            return abandoned.Count;
+        }
+
+        private static List<Pending> Take(Camera camera, object feature)
+        {
+            var result = new List<Pending>();
+            if (ReferenceEquals(camera, null)) return result;
+            lock (Gate)
+            {
+                if (feature != null && (!ActiveCameras.TryGetValue(camera, out object active) ||
+                    !ReferenceEquals(active, feature))) return result;
+                ActiveCameras.Remove(camera);
+                result = RemoveLocked(pending => ReferenceEquals(pending.Camera, camera));
+            }
+            return result;
+        }
+
+        private static List<Pending> Remove(Predicate<Pending> matches)
+        {
+            lock (Gate) return RemoveLocked(matches);
+        }
+
+        private static List<Pending> RemoveLocked(Predicate<Pending> matches)
+        {
+            var removed = new List<Pending>();
+            for (int index = 0; index < Work.Count;)
+            {
+                if (!matches(Work[index]))
+                {
+                    index++;
+                    continue;
+                }
+                removed.Add(Work[index]);
+                Work.RemoveAt(index);
+            }
+            return removed;
+        }
+    }
+
     /// <summary>Explicit BRG owner for static instance populations. Call mutation methods on the main thread.</summary>
     [UnityEngine.Scripting.APIUpdating.MovedFrom(true, "LoogaSoft.Terrain.Instances", "LoogaSoft.Terrain.Instances", "InstanceRenderer")]
-    public sealed class InstanceRenderer : IDisposable
+    public sealed partial class InstanceRenderer : IDisposable
     {
         private static int _nextOwner;
         private readonly int _owner = Interlocked.Increment(ref _nextOwner);
-        private readonly BatchRendererGroup _group;
+        // Unity calls every BatchRendererGroup for every culling view. The group exists only while storage exists.
+        private BatchRendererGroup _group;
         private readonly ComputeShader _shader;
         private readonly List<Population> _populations = new List<Population>();
         private readonly Dictionary<InstancePrototypeId, int> _registry = new Dictionary<InstancePrototypeId, int>();
+        private sealed class CameraEvaluation
+        {
+            internal long Sequence;
+        }
+
+        private readonly ConditionalWeakTable<Camera, CameraEvaluation> _cameraEvaluations = new();
+        private long _cameraEvaluationSequence;
         private readonly List<InstancePrototypeRegistration> _prototypeRegistrations = new();
         private readonly Vector4[] _planes = new Vector4[64];
         private readonly Vector4[] _splits = new Vector4[16];
@@ -44,8 +203,12 @@ namespace LoogaSoft.Instancing
         private readonly int _reset;
         private readonly int _resetAll;
         private readonly int _resetOcclusionStats;
+        // -1 for culling shaders without the kernel. Histories are then cleared by upload.
+        private readonly int _clearHistory;
         private readonly int _cull;
         private readonly int _cullParts;
+        private readonly int _cullGrouped;
+        private readonly int _cullPartsGrouped;
         private readonly int _selectVisibility;
         private readonly int _selectVisibilityOcclusion;
         private readonly int _updateLod;
@@ -55,6 +218,9 @@ namespace LoogaSoft.Instancing
         private readonly int _layer;
         private readonly string _worldSourceId;
         private readonly InstanceWorldContentKind _worldContentKind;
+        private readonly bool _staticTransforms;
+        private readonly Dictionary<InstanceWorldCells.CellPrototypeKey, int> _worldCellCounts = new();
+        private float _worldCellSize;
         private bool _worldCellsDirty;
         private InstanceWorldHierarchy _worldHierarchy;
         private InstanceHierarchySettings _hierarchySettings = InstanceHierarchySettings.Default;
@@ -78,7 +244,19 @@ namespace LoogaSoft.Instancing
         private readonly Stack<ScriptableRenderContext> _cameraContexts = new Stack<ScriptableRenderContext>();
 
         /// <summary>Maximum center distance, expanded by each instance bound. Infinite distance disables this limit.</summary>
-        public float MaxDistance { get; set; } = 1000;
+        private float _maxDistance = 1000;
+        public float MaxDistance
+        {
+            get => _maxDistance;
+            set
+            {
+                _maxDistance = value;
+                foreach (Population population in _populations)
+                {
+                    population.UpdateMaterialFade(GetViewDistance(population));
+                }
+            }
+        }
 
         /// <summary>Shadow distance in meters. The camera distance remains an upper limit.</summary>
         public float ShadowDistance { get; set; } = float.PositiveInfinity;
@@ -92,6 +270,9 @@ namespace LoogaSoft.Instancing
         /// <summary>Canonical prototypes registered by this renderer.</summary>
         public int RegisteredPrototypeCount => _prototypeRegistrations.Count;
 
+        /// <summary>True while the renderer owns a BatchRendererGroup. Empty renderers own none.</summary>
+        internal bool HasRendererGroup => _group != null;
+
         /// <summary>Spatial-registry identity for this renderer lifetime.</summary>
         public string WorldSourceId => _worldSourceId;
 
@@ -103,6 +284,15 @@ namespace LoogaSoft.Instancing
             _hierarchySettings = settings;
             _worldCellsDirty = true;
         }
+
+        /// <summary>Time spent in the last source flush, in milliseconds.</summary>
+        public double LastFlushBudgetMilliseconds { get; private set; }
+
+        /// <summary>Time spent preparing spatial order in the last source flush, in milliseconds.</summary>
+        public double LastSpatialOrderMilliseconds { get; private set; }
+
+        /// <summary>Time spent rebuilding world cells in the last source flush, in milliseconds.</summary>
+        public double LastWorldCellsMilliseconds { get; private set; }
 
         /// <summary>Total bytes uploaded by source changes since construction.</summary>
         public long UploadedBytes { get; private set; }
@@ -152,9 +342,16 @@ namespace LoogaSoft.Instancing
         }
 
         /// <summary>Create a renderer. No scene objects or native terrain settings are changed.</summary>
+        /// <param name="staticTransforms">True when instances are only added and removed. Update is then not allowed,
+        /// and the renderer keeps no previous-frame transforms for motion vectors.</param>
+        /// <param name="gpuResident">True when compute passes write instance ranges. The CPU keeps no per-instance
+        /// data. Transforms are static.</param>
         public InstanceRenderer(ComputeShader cullingShader = null, int layer = 0, string worldSourceId = null,
-            InstanceWorldContentKind worldContentKind = InstanceWorldContentKind.Generic)
+            InstanceWorldContentKind worldContentKind = InstanceWorldContentKind.Generic, bool staticTransforms = false,
+            bool gpuResident = false)
         {
+            _gpuResident = gpuResident;
+            _staticTransforms = staticTransforms || gpuResident;
             if (SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D12 || !SystemInfo.supportsComputeShaders)
             {
                 throw new NotSupportedException("The first instance renderer target is Windows Direct3D 12.");
@@ -175,17 +372,21 @@ namespace LoogaSoft.Instancing
             _reset = _shader.FindKernel("Reset");
             _resetAll = _shader.FindKernel("ResetAll");
             _resetOcclusionStats = _shader.FindKernel("ResetOcclusionStats");
+            _clearHistory = _shader.HasKernel("ClearHistory") ? _shader.FindKernel("ClearHistory") : -1;
             _cull = _shader.FindKernel("Cull");
             _cullParts = _shader.FindKernel("CullParts");
+            _cullGrouped = _shader.HasKernel("CullGrouped") ? _shader.FindKernel("CullGrouped") : _cull;
+            _cullPartsGrouped = _shader.HasKernel("CullPartsGrouped") ? _shader.FindKernel("CullPartsGrouped") : _cullParts;
             _selectVisibility = _shader.FindKernel("SelectVisibility");
             _selectVisibilityOcclusion = _shader.FindKernel("SelectVisibilityOcclusion");
             _updateLod = _shader.FindKernel("UpdateLod");
             _updateMeshLod = _shader.FindKernel("UpdateMeshLod");
             _patchRaw = _shader.FindKernel("PatchRawBuffer");
+            if (gpuResident)
+            {
+                InitializeGpuStorage();
+            }
             _disabledHistory = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, 16);
-            _group = new BatchRendererGroup(Cull, IntPtr.Zero);
-            _group.SetEnabledViewTypes(new[] { BatchCullingViewType.Camera, BatchCullingViewType.Light });
-            _group.SetGlobalBounds(new Bounds(Vector3.zero, Vector3.one));
             RenderPipelineManager.endContextRendering += EndContext;
             RenderPipelineManager.beginCameraRendering += BeginCamera;
             RenderPipelineManager.endCameraRendering += EndCamera;
@@ -201,6 +402,10 @@ namespace LoogaSoft.Instancing
             {
                 throw new ArgumentNullException(nameof(prototype));
             }
+            if (_gpuResident)
+            {
+                ValidateGpuPrototype(prototype);
+            }
             InstancePrototypeRegistration registration = InstancePrototypeRegistry.Acquire(prototype);
             if (_registry.TryGetValue(registration.Id, out int existing))
             {
@@ -211,7 +416,12 @@ namespace LoogaSoft.Instancing
             Population population;
             try
             {
-                population = new Population(registration.Prototype, _group, _shader, _patchRaw);
+                population = new Population(registration.Prototype, _shader, _patchRaw, _staticTransforms,
+                    _gpuResident);
+                if (_group != null)
+                {
+                    population.AttachGroup(_group);
+                }
             }
             catch
             {
@@ -239,15 +449,84 @@ namespace LoogaSoft.Instancing
             CheckDisposed();
             if ((uint)prototype >= (uint)_populations.Count) throw new ArgumentOutOfRangeException(nameof(prototype));
             quality.Validate(_populations[prototype].Prototype.HasColliders);
-            _populations[prototype].Quality = quality;
+            Population population = _populations[prototype];
+            float viewDistance = quality.ViewDistance > 0 ? quality.ViewDistance :
+                (population.Prototype.NativeLodDistance ? float.MaxValue : MaxDistance);
+            population.SetQuality(quality, viewDistance);
+        }
+
+        /// <summary>Read the current runtime quality policy for one prototype.</summary>
+        public InstanceQualitySettings GetQuality(int prototype)
+        {
+            CheckDisposed();
+            if ((uint)prototype >= (uint)_populations.Count) throw new ArgumentOutOfRangeException(nameof(prototype));
+            return _populations[prototype].Quality;
+        }
+
+        /// <summary>Read the live source count for one prototype before camera culling.</summary>
+        public int GetResidentCount(int prototype)
+        {
+            CheckDisposed();
+            if ((uint)prototype >= (uint)_populations.Count) throw new ArgumentOutOfRangeException(nameof(prototype));
+            return _populations[prototype].ResidentCount;
+        }
+
+        /// <summary>Read unique visible slots from the latest camera view. This call stalls the GPU.</summary>
+        public int ReadCameraVisibleCount(Camera camera, int prototype)
+        {
+            CheckDisposed();
+            if (camera == null) throw new ArgumentNullException(nameof(camera));
+            if ((uint)prototype >= (uint)_populations.Count) throw new ArgumentOutOfRangeException(nameof(prototype));
+            Population population = _populations[prototype];
+            var visible = new HashSet<uint>();
+            long latestEvaluation;
+            CameraEvaluation evaluation;
+            lock (_cameraEvaluations)
+            {
+                if (!_cameraEvaluations.TryGetValue(camera, out evaluation)) return 0;
+                latestEvaluation = evaluation.Sequence;
+            }
+            foreach (ViewBuffers view in population.Views)
+            {
+                if (!ReferenceEquals(view.Camera, camera) || view.EvaluationSequence != latestEvaluation ||
+                    view.SourceRevision != population.SourceRevision) continue;
+                var arguments = new uint[view.Arguments.count];
+                view.Arguments.GetData(arguments);
+                for (int bucket = 0; bucket < population.Prototype.PartCount * population.BucketsPerPart; bucket++)
+                {
+                    int count = (int)Math.Min(arguments[bucket * 5 + 1], (uint)population.Capacity);
+                    if (count == 0) continue;
+                    var indices = new uint[count];
+                    view.Visible.GetData(indices, 0, bucket * population.Capacity, count);
+                    bool packed = population.BucketsPerPart > 2 && bucket % population.BucketsPerPart >= 2;
+                    foreach (uint index in indices)
+                    {
+                        uint slot = packed ? index & 0x00ffffffu : index;
+                        // GPU-resident culling appends only active slots. The CPU has no per-slot state for them.
+                        if (slot < (uint)population.HighWater &&
+                            (_gpuResident || (population.Active[(int)slot] && population.Visible[(int)slot])))
+                        {
+                            visible.Add(slot);
+                        }
+                    }
+                }
+            }
+            lock (_cameraEvaluations)
+            {
+                if (!_cameraEvaluations.TryGetValue(camera, out evaluation) ||
+                    evaluation.Sequence != latestEvaluation) return 0;
+            }
+            return visible.Count;
         }
 
         /// <summary>Set a persistent density key. Preserve this key when a source unloads and returns.</summary>
         public bool SetVisibilityKey(InstanceHandle handle, uint key)
         {
+            CheckCpuStorage();
             if (!TryResolve(handle, out Population population)) return false;
             population.VisibilityKeys[handle.Slot] = key;
             population.Dirty.Add(handle.Slot);
+            population.SourceRevision++;
             return true;
         }
 
@@ -255,10 +534,12 @@ namespace LoogaSoft.Instancing
         public bool SetVisible(InstanceHandle handle, bool visible)
         {
             CheckDisposed();
+            CheckCpuStorage();
             if (!TryResolve(handle, out Population population)) return false;
             if (population.Visible[handle.Slot] == visible) return true;
             population.Visible[handle.Slot] = visible;
             population.Dirty.Add(handle.Slot);
+            population.SourceRevision++;
             return true;
         }
 
@@ -266,6 +547,7 @@ namespace LoogaSoft.Instancing
         public bool TryGetVisible(InstanceHandle handle, out bool visible)
         {
             CheckDisposed();
+            CheckCpuStorage();
             visible = false;
             if (!TryResolve(handle, out Population population)) return false;
             visible = population.Visible[handle.Slot];
@@ -276,6 +558,7 @@ namespace LoogaSoft.Instancing
         public InstanceHandle Add(int prototype, Matrix4x4 transform)
         {
             CheckDisposed();
+            CheckCpuStorage();
             ValidateTransform(transform);
             if (prototype < 0 || prototype >= _populations.Count)
             {
@@ -293,7 +576,10 @@ namespace LoogaSoft.Instancing
             }
             population.InitializeSlot(slot, transform);
             population.Dirty.Add(slot);
-            IncludeBounds(population.Prototype, transform);
+            population.ResidentCount++;
+            population.SourceRevision++;
+            IncludeBounds(population, transform);
+            ChangeWorldCellCount(prototype, transform, 1);
             _worldCellsDirty = true;
             InstanceCount++;
             return new InstanceHandle(_owner, prototype, slot, population.Generations[slot]);
@@ -303,6 +589,7 @@ namespace LoogaSoft.Instancing
         public InstanceHandle Add(int prototype, Matrix4x4 transform, InstanceAppearance appearance)
         {
             CheckDisposed();
+            CheckCpuStorage();
             if (prototype < 0 || prototype >= _populations.Count)
             {
                 throw new ArgumentOutOfRangeException(nameof(prototype));
@@ -317,6 +604,7 @@ namespace LoogaSoft.Instancing
         public bool UpdateAppearance(InstanceHandle handle, InstanceAppearance appearance)
         {
             CheckDisposed();
+            CheckCpuStorage();
             if (!TryResolve(handle, out Population population)) return false;
             population.ValidateAppearance(appearance);
             population.SetAppearance(handle.Slot, appearance);
@@ -327,11 +615,24 @@ namespace LoogaSoft.Instancing
         public bool Update(InstanceHandle handle, Matrix4x4 transform)
         {
             CheckDisposed();
+            CheckCpuStorage();
+            if (_staticTransforms)
+            {
+                throw new InvalidOperationException("This renderer has static transforms. Remove and add the instance instead.");
+            }
             if (!TryResolve(handle, out Population population)) return false;
             ValidateTransform(transform);
+            Matrix4x4 previous = population.Transforms[handle.Slot];
             population.SetTransform(handle.Slot, transform);
             population.Dirty.Add(handle.Slot);
-            IncludeBounds(population.Prototype, transform);
+            population.SourceRevision++;
+            IncludeBounds(population, transform);
+            if (!InstanceWorldCells.GetCell(Position(previous), _worldContentKind).Equals(
+                InstanceWorldCells.GetCell(Position(transform), _worldContentKind)))
+            {
+                ChangeWorldCellCount(handle.Prototype, previous, -1);
+                ChangeWorldCellCount(handle.Prototype, transform, 1);
+            }
             _worldCellsDirty = true;
             return true;
         }
@@ -340,13 +641,18 @@ namespace LoogaSoft.Instancing
         public bool Remove(InstanceHandle handle)
         {
             CheckDisposed();
+            CheckCpuStorage();
             if (!TryResolve(handle, out Population population)) return false;
+            ChangeWorldCellCount(handle.Prototype, population.Transforms[handle.Slot], -1);
             population.Active[handle.Slot] = false;
             population.Visible[handle.Slot] = false;
             population.Generations[handle.Slot]++;
             population.Free.Push(handle.Slot);
             population.Dirty.Add(handle.Slot);
             population.MarkSpatialOrderDirty();
+            population.ResidentCount--;
+            population.SourceRevision++;
+            if (population.ResidentCount == 0) population.HierarchyReach = 0;
             _boundsDirty = true;
             _worldCellsDirty = true;
             InstanceCount--;
@@ -360,7 +666,7 @@ namespace LoogaSoft.Instancing
             {
                 foreach (var population in _populations)
                 {
-                    if (population.Dirty.Count > 0) return true;
+                    if (population.Dirty.Count > 0 || population.GpuCommitPending) return true;
                 }
                 return false;
             }
@@ -380,25 +686,52 @@ namespace LoogaSoft.Instancing
             {
                 throw new ArgumentOutOfRangeException(nameof(byteBudget), "Allow at least the 64-byte default header.");
             }
-            long remaining = byteBudget;
-            foreach (Population population in _populations)
+            long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            LastSpatialOrderMilliseconds = 0;
+            LastWorldCellsMilliseconds = 0;
+            try
             {
-                long uploaded = population.Upload(remaining);
-                UploadedBytes += uploaded;
-                remaining -= uploaded;
-                population.PrepareSpatialOrder();
+                long remaining = byteBudget;
+                EnsureGroupWhenNeeded();
+                foreach (Population population in _populations)
+                {
+                    if (_gpuResident)
+                    {
+                        CommitGpu(population);
+                        continue;
+                    }
+                    long uploaded = population.Upload(remaining);
+                    UploadedBytes += uploaded;
+                    remaining -= uploaded;
+                    long spatialStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    population.PrepareSpatialOrder();
+                    LastSpatialOrderMilliseconds += ElapsedMilliseconds(spatialStart);
+                }
+                ReleaseGroupIfEmpty();
+                if (_boundsDirty && _group != null)
+                {
+                    _group.SetGlobalBounds(InstanceCount == 0 ? new Bounds(Vector3.zero, Vector3.one) : _worldBounds);
+                    _boundsDirty = false;
+                }
+                bool complete = !HasPendingUploads;
+                if (complete && _worldCellsDirty)
+                {
+                    long worldCellsStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    RefreshWorldCells();
+                    LastWorldCellsMilliseconds = ElapsedMilliseconds(worldCellsStart);
+                }
+                return complete;
             }
-            if (_boundsDirty)
+            finally
             {
-                _group.SetGlobalBounds(InstanceCount == 0 ? new Bounds(Vector3.zero, Vector3.one) : _worldBounds);
-                _boundsDirty = false;
+                LastFlushBudgetMilliseconds = ElapsedMilliseconds(flushStart);
             }
-            bool complete = !HasPendingUploads;
-            if (complete && _worldCellsDirty)
-            {
-                RefreshWorldCells();
-            }
-            return complete;
+        }
+
+        private static double ElapsedMilliseconds(long start)
+        {
+            return (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000.0 /
+                System.Diagnostics.Stopwatch.Frequency;
         }
 
         /// <summary>Release empty population storage and shrink unused trailing capacity without changing live handles.</summary>
@@ -409,11 +742,52 @@ namespace LoogaSoft.Instancing
             {
                 population.TrimExcess();
             }
+            ReleaseGroupIfEmpty();
         }
 
-        private void IncludeBounds(InstancePrototype prototype, Matrix4x4 transform)
+        // Create the group before the first population creates storage. Empty renderers then cost no culling callback.
+        private void EnsureGroupWhenNeeded()
         {
-            Bounds bounds = InstancePrototype.TransformBounds(prototype.Bounds, transform);
+            if (_group != null) return;
+            bool needed = false;
+            foreach (Population population in _populations)
+            {
+                needed |= population.Capacity > 0;
+            }
+            if (!needed) return;
+            _group = new BatchRendererGroup(Cull, IntPtr.Zero);
+            _group.SetEnabledViewTypes(new[] { BatchCullingViewType.Camera, BatchCullingViewType.Light });
+            _group.SetGlobalBounds(InstanceCount == 0 ? new Bounds(Vector3.zero, Vector3.one) : _worldBounds);
+            _boundsDirty = false;
+            foreach (Population population in _populations)
+            {
+                population.AttachGroup(_group);
+            }
+        }
+
+        // Remove the group after every population releases its storage. Queued culling work for it is cancelled.
+        private void ReleaseGroupIfEmpty()
+        {
+            if (_group == null) return;
+            foreach (Population population in _populations)
+            {
+                if (population.Buffer != null || population.Capacity > 0) return;
+            }
+            InstanceCullScheduler.CancelOwner(this);
+            foreach (Population population in _populations)
+            {
+                population.DetachGroup();
+            }
+            _group.Dispose();
+            _group = null;
+        }
+
+        private void IncludeBounds(Population population, Matrix4x4 transform)
+        {
+            Bounds bounds = InstancePrototype.TransformBounds(population.Prototype.Bounds, transform);
+            Vector3 source = new Vector3(transform.m03, transform.m13, transform.m23);
+            population.HierarchyReach = Mathf.Max(population.HierarchyReach,
+                (bounds.center - source).magnitude + bounds.extents.magnitude);
             if (InstanceCount == 0)
             {
                 _worldBounds = bounds;
@@ -430,6 +804,7 @@ namespace LoogaSoft.Instancing
         {
             if (_disposed) return;
             _disposed = true;
+            InstanceCullScheduler.CancelOwner(this);
             InstanceOcclusion.Remove(this);
             RenderPipelineManager.endContextRendering -= EndContext;
             RenderPipelineManager.beginCameraRendering -= BeginCamera;
@@ -443,27 +818,62 @@ namespace LoogaSoft.Instancing
             {
                 registration.Dispose();
             }
-            _group.Dispose();
+            _group?.Dispose();
+            _group = null;
             _disabledHistory.Dispose();
+            DisposeGpuStorage();
             _registry.Clear();
+            _worldCellCounts.Clear();
             _prototypeRegistrations.Clear();
             _populations.Clear();
             InstanceCount = 0;
         }
 
+        private static Vector3 Position(Matrix4x4 transform)
+        {
+            return new Vector3(transform.m03, transform.m13, transform.m23);
+        }
+
+        private void ChangeWorldCellCount(int prototype, Matrix4x4 transform, int change)
+        {
+            if (_worldCellSize != InstanceWorldCells.GetCellSize(_worldContentKind)) return;
+            var key = new InstanceWorldCells.CellPrototypeKey(
+                InstanceWorldCells.GetCell(Position(transform), _worldContentKind),
+                _prototypeRegistrations[prototype].Id);
+            _worldCellCounts.TryGetValue(key, out int count);
+            count = checked(count + change);
+            if (count == 0) _worldCellCounts.Remove(key);
+            else _worldCellCounts[key] = count;
+        }
+
         private void RefreshWorldCells()
         {
-            using InstanceWorldCellUpdate update = InstanceWorldCells.BeginUpdate(_worldSourceId, _worldContentKind);
-            for (int prototype = 0; prototype < _populations.Count; prototype++)
+            float cellSize = InstanceWorldCells.GetCellSize(_worldContentKind);
+            if (_worldCellSize != cellSize)
             {
-                Population population = _populations[prototype];
-                InstancePrototypeId id = _prototypeRegistrations[prototype].Id;
-                for (int slot = 0; slot < population.HighWater; slot++)
+                _worldCellCounts.Clear();
+                _worldCellSize = cellSize;
+                for (int prototype = 0; prototype < _populations.Count; prototype++)
                 {
-                    if (!population.Active[slot]) continue;
-                    Matrix4x4 matrix = population.Transforms[slot];
-                    update.Add(new Vector3(matrix.m03, matrix.m13, matrix.m23), id);
+                    Population population = _populations[prototype];
+                    if (_gpuResident)
+                    {
+                        AddAllRangeCells(prototype, population);
+                        continue;
+                    }
+                    for (int slot = 0; slot < population.HighWater; slot++)
+                    {
+                        if (population.Active[slot])
+                        {
+                            ChangeWorldCellCount(prototype, population.Transforms[slot], 1);
+                        }
+                    }
                 }
+            }
+            using InstanceWorldCellUpdate update = InstanceWorldCells.BeginUpdate(_worldSourceId, _worldContentKind);
+            foreach (var pair in _worldCellCounts)
+            {
+                update.Add(InstanceWorldCells.GetBounds(pair.Key.Cell).center, pair.Key.Prototype, pair.Value);
             }
             update.Commit(InstanceCellResidencyState.Resident);
             _worldHierarchy = InstanceWorldHierarchy.Build(_worldSourceId, _hierarchySettings);
@@ -529,6 +939,13 @@ namespace LoogaSoft.Instancing
             }
         }
 
+        // Static instances move only by shader deformation, such as wind. That motion is below a pixel on coarser
+        // levels, where camera reprojection is enough. Only the finest level draws per-object motion vectors.
+        private bool HasMotionVectors(InstancePrototype.Part part)
+        {
+            return part.HasMotion && (!_staticTransforms || (part.Lod == 0 && part.MeshLevel == 0));
+        }
+
         private static void ValidateTransform(Matrix4x4 transform)
         {
             for (int i = 0; i < 16; i++)
@@ -547,12 +964,32 @@ namespace LoogaSoft.Instancing
 
         private readonly Stack<Camera> _cameraViews = new();
 
+        private long RecordCameraEvaluation(Camera camera)
+        {
+            if (ReferenceEquals(camera, null)) return 0;
+            lock (_cameraEvaluations)
+            {
+                long sequence = ++_cameraEvaluationSequence;
+                _cameraEvaluations.GetValue(camera, _ => new CameraEvaluation()).Sequence = sequence;
+                return sequence;
+            }
+        }
+
         private void BeginCamera(ScriptableRenderContext context, Camera camera)
         {
+            RecordCameraEvaluation(camera);
+            if (RenderingEnabled)
+            {
+                EnsureGroupWhenNeeded();
+            }
             foreach (Population population in _populations)
             {
                 population.AdvanceFrame(Time.frameCount);
-                if (RenderingEnabled)
+                if (RenderingEnabled && _gpuResident)
+                {
+                    CommitGpu(population);
+                }
+                else if (RenderingEnabled)
                 {
                     UploadedBytes += population.Upload(long.MaxValue);
                 }
@@ -566,6 +1003,7 @@ namespace LoogaSoft.Instancing
 
         private void EndCamera(ScriptableRenderContext context, Camera camera)
         {
+            InstanceCullScheduler.Cancel(camera);
             if (_cameraContexts.Count > 0)
             {
                 _cameraContexts.Pop();
@@ -583,8 +1021,34 @@ namespace LoogaSoft.Instancing
             _viewCursor = 0;
         }
 
-        private unsafe JobHandle Cull(BatchRendererGroup group, BatchCullingContext context, BatchCullingOutput output, IntPtr userContext)
+        // One CPU marker for each content kind. Profiles then show which renderers own the culling callbacks.
+        private static readonly Unity.Profiling.ProfilerMarker[] CullMarkers = CreateCullMarkers();
+
+        private static Unity.Profiling.ProfilerMarker[] CreateCullMarkers()
         {
+            var names = Enum.GetNames(typeof(InstanceWorldContentKind));
+            var markers = new Unity.Profiling.ProfilerMarker[names.Length];
+            for (int i = 0; i < names.Length; i++)
+            {
+                markers[i] = new Unity.Profiling.ProfilerMarker("Looga.Cull " + names[i]);
+            }
+            return markers;
+        }
+
+        private JobHandle Cull(BatchRendererGroup group, BatchCullingContext context, BatchCullingOutput output, IntPtr userContext)
+        {
+            using (CullMarkers[(int)_worldContentKind].Auto())
+            {
+                return CullViews(context, output);
+            }
+        }
+
+        private unsafe JobHandle CullViews(BatchCullingContext context, BatchCullingOutput output)
+        {
+            Camera camera = context.viewType == BatchCullingViewType.Camera && _cameraViews.Count > 0 ?
+                _cameraViews.Peek() : null;
+            // Advance camera diagnostics before an empty cull can return.
+            long evaluationSequence = RecordCameraEvaluation(camera);
             if (!RenderingEnabled) return default;
             if (_disposed || InstanceCount == 0 || (context.cullingLayerMask & (1u << _layer)) == 0 ||
                 (context.viewType != BatchCullingViewType.Camera && context.viewType != BatchCullingViewType.Light)) return default;
@@ -624,6 +1088,7 @@ namespace LoogaSoft.Instancing
             float scale = QualitySettings.lodBias / (2 * (lod.isOrthographic ? Mathf.Max(lod.orthoSize, 0.001f) :
                 Mathf.Tan(lod.fieldOfView * Mathf.Deg2Rad * 0.5f)));
             var cmd = CommandBufferPool.Get("Looga Instances.Cull");
+            bool queued = false;
             try
             {
                 cmd.SetComputeIntParam(_shader, "_PlaneCount", planeCount);
@@ -632,15 +1097,25 @@ namespace LoogaSoft.Instancing
                 cmd.SetComputeVectorArrayParam(_shader, "_Splits", _splits);
                 cmd.SetComputeVectorParam(_shader, "_Camera", lod.cameraPosition);
                 bool shadow = context.viewType == BatchCullingViewType.Light;
-                Camera camera = !shadow && _cameraViews.Count > 0 ? _cameraViews.Peek() : null;
+                string selectSample = shadow ? "Looga.Select Light" : "Looga.Select Camera";
+                string lodSample = shadow ? "Looga.LOD Light" : "Looga.LOD Camera";
+                string appendSample = shadow ? "Looga.Append Light" : "Looga.Append Camera";
                 bool hasOcclusion = InstanceVisibility.TryGet(camera,
                     out InstanceVisibilityContext visibility);
                 InstanceVisibilityMode adaptiveMode = VisibilityMode;
                 if (_worldHierarchy != null)
                 {
-                    float hierarchyDistance = shadow ? Mathf.Min(MaxDistance, ShadowDistance) : MaxDistance;
+                    float hierarchyDistance = 0;
+                    float hierarchyReach = 0;
+                    foreach (Population population in _populations)
+                    {
+                        if (shadow && population.Quality.ShadowMode == InstanceShadowMode.Off) continue;
+                        float range = shadow ? GetShadowDistance(population) : GetViewDistance(population);
+                        hierarchyDistance = Mathf.Max(hierarchyDistance, range);
+                        hierarchyReach = Mathf.Max(hierarchyReach, population.HierarchyReach);
+                    }
                     LastHierarchyDecision = _worldHierarchy.Evaluate(_planes, planeCount, lod.cameraPosition,
-                        hierarchyDistance, hasOcclusion, VisibilityMode);
+                        hierarchyDistance, hasOcclusion, VisibilityMode, hierarchyReach);
                     if (!LastHierarchyDecision.Visible)
                     {
                         _viewCursor++;
@@ -663,21 +1138,29 @@ namespace LoogaSoft.Instancing
                     {
                         continue;
                     }
-                    float distance = population.Prototype.NativeLodDistance ? float.MaxValue : MaxDistance;
                     var quality = population.Quality;
-                    float shadowLimit = Mathf.Min(distance, ShadowDistance);
-                    if (quality.ShadowDistance > 0)
-                    {
-                        shadowLimit = Mathf.Min(shadowLimit, quality.ShadowDistance);
-                    }
-                    cmd.SetComputeVectorParam(_shader, "_Lod", new Vector4(scale * population.Prototype.LodBias, lod.isOrthographic ? 1 : 0,
-                        shadow ? shadowLimit : distance,
+                    if (shadow && quality.ShadowMode == InstanceShadowMode.Off) continue;
+                    bool groupedCull = population.ResidentCount >= 4096;
+                    int cullKernel = groupedCull ? _cullGrouped : _cull;
+                    int cullPartsKernel = groupedCull ? _cullPartsGrouped : _cullParts;
+                    float distance = shadow ? GetShadowDistance(population) : GetViewDistance(population);
+                    float lodBias = population.Prototype.LodBias * (quality.LodBias > 0 ? quality.LodBias : 1);
+                    cmd.SetComputeVectorParam(_shader, "_Lod", new Vector4(scale * lodBias, lod.isOrthographic ? 1 : 0,
+                        distance,
                         Mathf.Clamp(Mathf.Max(QualitySettings.maximumLODLevel, shadow ? Mathf.Max(MinimumShadowLod, quality.MinimumShadowLod) : 0), 0, 7)));
                     bool limitSplits = shadow && context.projectionType == BatchCullingProjectionType.Orthographic && quality.ShadowSplits > 0;
                     int admittedSplits = limitSplits ? Mathf.Min(splitCount, quality.ShadowSplits) : splitCount;
                     cmd.SetComputeIntParam(_shader, "_SplitCount", admittedSplits);
                     cmd.SetComputeVectorParam(_shader, "_Quality", new Vector4(quality.Density, shadow ? 0 : quality.MinimumPixels,
-                        shadow ? quality.ShadowFadeDistance : 0, Mathf.Max(1, lod.cameraPixelHeight) / population.Prototype.LodBias));
+                        shadow ? quality.ShadowFadeDistance : 0, Mathf.Max(1, lod.cameraPixelHeight) / lodBias));
+                    bool viewFade = !shadow && quality.ViewFadeDistance > 0 && distance < float.MaxValue;
+                    bool allMaterialFade = viewFade && population.AllMaterialViewFade;
+                    // Camera views only. Shadows keep the full population inside their shorter range.
+                    bool falloff = !shadow && quality.DensityFalloffDistance > 0 && distance < float.MaxValue &&
+                        quality.DensityFalloffDistance < distance;
+                    cmd.SetComputeVectorParam(_shader, "_ViewFade", new Vector4(distance,
+                        viewFade && !allMaterialFade ? quality.ViewFadeDistance : 0,
+                        falloff ? quality.DensityFalloffDistance : 0, quality.FarDensity));
 
                     ViewBuffers view = population.GetView(_viewCursor);
                     cmd.SetComputeIntParam(_shader, "_Count", population.HighWater);
@@ -698,6 +1181,8 @@ namespace LoogaSoft.Instancing
                     }
                     view.Camera = camera;
                     view.Frame = Time.frameCount;
+                    view.EvaluationSequence = evaluationSequence;
+                    view.SourceRevision = population.SourceRevision;
                     view.Parameters = lod;
                     view.LodScale = scale;
                     population.EnsureClusters(selectionMode >= 2 ? (population.Capacity + 63) / 64 : 1);
@@ -706,9 +1191,10 @@ namespace LoogaSoft.Instancing
                     cmd.SetComputeIntParam(_shader, "_SelectionMode", selectionMode);
                     cmd.SetComputeIntParam(_shader, "_UseSpatialOrder", selectionMode >= 2 ? 1 : 0);
                     view.EnsureSelection(selectionMode > 0 ? population.Capacity : 1);
-                    cmd.SetComputeBufferParam(_shader, _cull, "_Selection", view.Selection);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_Selection", view.Selection);
                     if (selectionMode > 0)
                     {
+                        cmd.BeginSample(selectSample);
                         int selectKernel = populationOcclusion ? _selectVisibilityOcclusion : _selectVisibility;
                         cmd.SetComputeBufferParam(_shader, selectKernel, "_Selection", view.Selection);
                         cmd.SetComputeBufferParam(_shader, selectKernel, "_Clusters", population.Clusters);
@@ -738,6 +1224,7 @@ namespace LoogaSoft.Instancing
                             cmd.SetComputeIntParam(_shader, "_OcclusionFlipY", SystemInfo.graphicsUVStartsAtTop ? 1 : 0);
                         }
                         cmd.DispatchCompute(_shader, selectKernel, (population.HighWater + 63) / 64, 1, 1);
+                        cmd.EndSample(selectSample);
                         if (populationOcclusion && visibility.Measure)
                         {
                             Camera sampledCamera = camera;
@@ -766,45 +1253,51 @@ namespace LoogaSoft.Instancing
                     bool animated = population.Prototype.AnimatedCrossFade;
                     cmd.SetComputeIntParam(_shader, "_AnimatedFade", animated ? 1 : 0);
                     cmd.SetComputeVectorParam(_shader, "_TransitionTime", new Vector4(Time.time, Mathf.Max(0.001f, LODGroup.crossFadeAnimationDuration), 0, 0));
-                    var history = animated ? population.GetHistory(context.viewID, lod, _cameraViews.Count > 0 && _cameraViews.Peek() ? _cameraViews.Peek().transform.forward : Vector3.forward) : _disabledHistory;
+                    var history = animated ? population.GetHistory(context.viewID, lod, _cameraViews.Count > 0 && _cameraViews.Peek() ? _cameraViews.Peek().transform.forward : Vector3.forward, cmd, _shader, _clearHistory) : _disabledHistory;
                     view.LodHistory = history;
-                    cmd.SetComputeBufferParam(_shader, _cull, "_LodHistory", history);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_LodHistory", history);
                     if (animated)
                     {
                         cmd.SetComputeBufferParam(_shader, _updateLod, "_LodHistory", history);
                         cmd.SetComputeBufferParam(_shader, _updateLod, "_Bounds", population.BoundsBuffer);
+                        cmd.BeginSample(lodSample);
                         cmd.DispatchCompute(_shader, _updateLod, (population.HighWater + 63) / 64, 1, 1);
+                        cmd.EndSample(lodSample);
                     }
                     cmd.SetComputeBufferParam(_shader, _reset, "_Arguments", view.Arguments);
-                    cmd.SetComputeBufferParam(_shader, _cull, "_Arguments", view.Arguments);
-                    cmd.SetComputeBufferParam(_shader, _cull, "_Visible", view.Visible);
-                    cmd.SetComputeBufferParam(_shader, _cull, "_Bounds", population.BoundsBuffer);
-                    cmd.SetComputeBufferParam(_shader, _cull, "_InstanceData", population.Buffer);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_Arguments", view.Arguments);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_Visible", view.Visible);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_Bounds", population.BoundsBuffer);
+                    cmd.SetComputeBufferParam(_shader, cullKernel, "_InstanceData", population.Buffer);
                     float meshMetric = 2 * (lod.isOrthographic ? lod.orthoSize : Mathf.Tan(lod.fieldOfView * Mathf.Deg2Rad * 0.5f));
                     cmd.SetComputeFloatParam(_shader, "_MeshMetric", QualitySettings.meshLodThreshold * meshMetric /
-                        (Mathf.Max(1, lod.cameraPixelHeight) * population.Prototype.LodBias));
-                    bool fusedParts = !QualitySettings.enableLODCrossFade || !population.HasMeshLod;
+                        (Mathf.Max(1, lod.cameraPixelHeight) * lodBias));
+                    bool mixedViewFade = viewFade && population.HasMaterialViewFade && !allMaterialFade;
+                    bool fusedParts = (!QualitySettings.enableLODCrossFade || !population.HasMeshLod) && !mixedViewFade;
                     if (fusedParts)
                     {
                         cmd.SetComputeIntParam(_shader, "_PartCount", population.Prototype.PartCount);
                         cmd.SetComputeBufferParam(_shader, _resetAll, "_Arguments", view.Arguments);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_Arguments", view.Arguments);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_Visible", view.Visible);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_Bounds", population.BoundsBuffer);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_InstanceData", population.Buffer);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_Selection", view.Selection);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_LodHistory", history);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_MeshHistory", _disabledHistory);
-                        cmd.SetComputeBufferParam(_shader, _cullParts, "_PartParameters", population.PartParameters);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_Arguments", view.Arguments);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_Visible", view.Visible);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_Bounds", population.BoundsBuffer);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_InstanceData", population.Buffer);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_Selection", view.Selection);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_LodHistory", history);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_MeshHistory", _disabledHistory);
+                        cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_PartParameters", population.PartParameters);
+                        cmd.BeginSample(appendSample);
                         cmd.DispatchCompute(_shader, _resetAll,
                             (population.Prototype.PartCount * population.BucketsPerPart + 63) / 64, 1, 1);
-                        cmd.DispatchCompute(_shader, _cullParts, (population.HighWater + 63) / 64,
+                        cmd.DispatchCompute(_shader, cullPartsKernel, (population.HighWater + 63) / 64,
                             population.Prototype.PartCount, 1);
+                        cmd.EndSample(appendSample);
                     }
                     for (int partIndex = 0; partIndex < population.Prototype.PartCount; partIndex++)
                     {
                         InstancePrototype.Part part = population.Prototype.Parts[partIndex];
                         cmd.SetComputeIntParam(_shader, "_Part", partIndex);
+                        cmd.SetComputeIntParam(_shader, "_PartData", population.DataPartOf(partIndex));
                         cmd.SetComputeIntParam(_shader, "_PartLod", part.Lod);
                         cmd.SetComputeIntParam(_shader, "_PartFlip", part.Local.determinant < 0 ? 1 : 0);
                         cmd.SetComputeIntParam(_shader, "_MeshLevel", part.MeshLevel);
@@ -814,21 +1307,26 @@ namespace LoogaSoft.Instancing
                         cmd.SetComputeVectorParam(_shader, "_MeshExtents", part.Mesh.bounds.extents);
                         bool meshFade = !fusedParts && part.MeshLevels > 1 && QualitySettings.enableLODCrossFade;
                         cmd.SetComputeIntParam(_shader, "_MeshFade", meshFade ? 1 : 0);
+                        cmd.SetComputeIntParam(_shader, "_PartMaterialFade", viewFade && population.PartHasMaterialViewFade(partIndex) ? 1 : 0);
                         var meshHistory = meshFade ? population.GetHistory(context.viewID, lod,
-                            _cameraViews.Count > 0 && _cameraViews.Peek() ? _cameraViews.Peek().transform.forward : Vector3.forward, partIndex) : _disabledHistory;
+                            _cameraViews.Count > 0 && _cameraViews.Peek() ? _cameraViews.Peek().transform.forward : Vector3.forward, cmd, _shader, _clearHistory, partIndex) : _disabledHistory;
                         view.MeshHistories[partIndex] = meshHistory;
-                        cmd.SetComputeBufferParam(_shader, _cull, "_MeshHistory", meshHistory);
+                        cmd.SetComputeBufferParam(_shader, cullKernel, "_MeshHistory", meshHistory);
                         if (meshFade)
                         {
                             cmd.SetComputeBufferParam(_shader, _updateMeshLod, "_LodHistory", meshHistory);
                             cmd.SetComputeBufferParam(_shader, _updateMeshLod, "_Bounds", population.BoundsBuffer);
                             cmd.SetComputeBufferParam(_shader, _updateMeshLod, "_InstanceData", population.Buffer);
+                            cmd.BeginSample(lodSample);
                             cmd.DispatchCompute(_shader, _updateMeshLod, (population.HighWater + 63) / 64, 1, 1);
+                            cmd.EndSample(lodSample);
                         }
                         if (!fusedParts)
                         {
+                            cmd.BeginSample(appendSample);
                             cmd.DispatchCompute(_shader, _reset, 1, 1, 1);
-                            cmd.DispatchCompute(_shader, _cull, (population.HighWater + 63) / 64, 1, 1);
+                            cmd.DispatchCompute(_shader, cullKernel, (population.HighWater + 63) / 64, 1, 1);
+                            cmd.EndSample(appendSample);
                         }
                         int begin = result->indirectDrawCommandCount;
                         for (int entry = 0; entry < population.BucketsPerPart; entry++)
@@ -840,7 +1338,7 @@ namespace LoogaSoft.Instancing
                                 batchID = population.Batches[partIndex],
                                 meshID = population.Meshes[partIndex],
                                 materialID = population.Materials[partIndex],
-                                flags = (part.HasMotion ? BatchDrawCommandFlags.HasMotion : BatchDrawCommandFlags.None) |
+                                flags = (HasMotionVectors(part) ? BatchDrawCommandFlags.HasMotion : BatchDrawCommandFlags.None) |
                                     (part.LightmapIndex != ushort.MaxValue ? BatchDrawCommandFlags.IsLightMapped : BatchDrawCommandFlags.None) |
                                     BatchDrawCommandFlags.UseLegacyLightmapsKeyword |
                                     ((entry & 1) == 0 ? BatchDrawCommandFlags.None : BatchDrawCommandFlags.FlipWinding) |
@@ -867,26 +1365,32 @@ namespace LoogaSoft.Instancing
                                 layer = (byte)_layer,
                                 renderingLayerMask = part.RenderingLayers,
                                 sceneCullingMask = ulong.MaxValue,
-                                shadowCastingMode = part.Shadows,
+                                shadowCastingMode = quality.ShadowMode switch
+                                {
+                                    InstanceShadowMode.On => ShadowCastingMode.On,
+                                    InstanceShadowMode.Off => ShadowCastingMode.Off,
+                                    InstanceShadowMode.TwoSided => ShadowCastingMode.TwoSided,
+                                    _ => part.Shadows
+                                },
                                 receiveShadows = part.ReceiveShadows,
                                 motionMode = part.HasMotion ? MotionVectorGenerationMode.Object : MotionVectorGenerationMode.Camera
                             }
                         };
                     }
                 }
-                if (_hasRenderContext)
+                // URP submits the culling work after all view requests are known.
+                Camera renderCamera = _cameraViews.Count > 0 ? _cameraViews.Peek() : null;
+                queued = _hasRenderContext && InstanceCullScheduler.TryQueue(this, renderCamera, _renderContext, cmd);
+                if (!queued)
                 {
-                    _renderContext.ExecuteCommandBuffer(cmd);
-                }
-                else
-                {
-                    Graphics.ExecuteCommandBuffer(cmd);
+                    if (_hasRenderContext) _renderContext.ExecuteCommandBuffer(cmd);
+                    else Graphics.ExecuteCommandBuffer(cmd);
                 }
                 _viewCursor++;
             }
             finally
             {
-                CommandBufferPool.Release(cmd);
+                if (!queued) CommandBufferPool.Release(cmd);
             }
             return default;
         }
@@ -904,6 +1408,8 @@ namespace LoogaSoft.Instancing
             internal GraphicsBuffer Selection;
             internal Camera Camera;
             internal int Frame;
+            internal long EvaluationSequence;
+            internal uint SourceRevision;
             internal LODParameters Parameters;
             internal float LodScale;
             internal int SelectionMode;
@@ -953,15 +1459,109 @@ namespace LoogaSoft.Instancing
             internal Vector4 Extents;
         }
 
-        private sealed class Population : IDisposable
+        private float GetViewDistance(Population population)
+        {
+            if (population.Quality.ViewDistance > 0) return population.Quality.ViewDistance;
+            return population.Prototype.NativeLodDistance ? float.MaxValue : MaxDistance;
+        }
+
+        private float GetShadowDistance(Population population)
+        {
+            float limit = Mathf.Min(population.Prototype.NativeLodDistance ? float.MaxValue : MaxDistance, ShadowDistance);
+            if (population.Quality.ShadowDistance > 0)
+            {
+                limit = Mathf.Min(limit, population.Quality.ShadowDistance);
+            }
+            return limit;
+        }
+
+        // Ordered slot set without per-slot allocation. Ascending iteration keeps uploads in contiguous ranges.
+        internal sealed class SlotSet
+        {
+            private ulong[] _words = Array.Empty<ulong>();
+            // No word below this index holds a set bit.
+            private int _lowWord;
+
+            internal int Count { get; private set; }
+
+            internal bool Add(int slot)
+            {
+                int word = slot >> 6;
+                if (word >= _words.Length)
+                {
+                    Array.Resize(ref _words, Math.Max(word + 1, _words.Length * 2));
+                }
+                ulong bit = 1UL << (slot & 63);
+                if ((_words[word] & bit) != 0) return false;
+                _words[word] |= bit;
+                _lowWord = Count == 0 ? word : Math.Min(_lowWord, word);
+                Count++;
+                return true;
+            }
+
+            internal bool Remove(int slot)
+            {
+                int word = slot >> 6;
+                if (word >= _words.Length) return false;
+                ulong bit = 1UL << (slot & 63);
+                if ((_words[word] & bit) == 0) return false;
+                _words[word] &= ~bit;
+                Count--;
+                return true;
+            }
+
+            internal void Clear()
+            {
+                Array.Clear(_words, 0, _words.Length);
+                _lowWord = 0;
+                Count = 0;
+            }
+
+            // The foreach pattern requires public members. The containing type stays internal.
+            public Enumerator GetEnumerator() => new Enumerator(_words, Count == 0 ? _words.Length : _lowWord);
+
+            public struct Enumerator
+            {
+                private readonly ulong[] _words;
+                private int _word;
+                private ulong _bits;
+
+                internal Enumerator(ulong[] words, int start)
+                {
+                    _words = words;
+                    _word = start - 1;
+                    _bits = 0;
+                    Current = -1;
+                }
+
+                public int Current { get; private set; }
+
+                public bool MoveNext()
+                {
+                    while (_bits == 0)
+                    {
+                        if (++_word >= _words.Length) return false;
+                        _bits = _words[_word];
+                    }
+                    Current = (_word << 6) + math.tzcnt(_bits);
+                    _bits &= _bits - 1;
+                    return true;
+                }
+            }
+        }
+
+        private sealed partial class Population : IDisposable
         {
             internal readonly InstancePrototype Prototype;
             internal readonly int BucketsPerPart;
             internal InstanceQualitySettings Quality = InstanceQualitySettings.Default;
+            internal int ResidentCount;
+            internal float HierarchyReach;
+            internal uint SourceRevision;
             internal uint[] VisibilityKeys = Array.Empty<uint>();
             internal bool[] Visible = Array.Empty<bool>();
             internal readonly Stack<int> Free = new Stack<int>();
-            internal readonly SortedSet<int> Dirty = new SortedSet<int>();
+            internal readonly SlotSet Dirty = new SlotSet();
             internal readonly Vector4[] ThresholdVectors = new Vector4[2];
             internal readonly Vector4[] FadeVectors = new Vector4[2];
             internal readonly BatchMeshID[] Meshes;
@@ -991,7 +1591,8 @@ namespace LoogaSoft.Instancing
                 ClusterDirty = true;
             }
 
-            private readonly BatchRendererGroup _group;
+            // Set while the renderer owns a group. Meshes, materials and batches are registered only then.
+            private BatchRendererGroup _group;
             internal readonly List<ViewBuffers> Views = new List<ViewBuffers>();
             private readonly Dictionary<(BatchPackedCullingViewID View, int Part), TransitionHistory> _histories = new();
             private readonly List<(BatchPackedCullingViewID View, int Part)> _expiredHistories = new();
@@ -1006,6 +1607,8 @@ namespace LoogaSoft.Instancing
             private GpuBounds[] _bounds;
             private uint[] _spatialOrder = Array.Empty<uint>();
             private SpatialEntry[] _spatialEntries = Array.Empty<SpatialEntry>();
+            private SpatialEntry[] _spatialScratch = Array.Empty<SpatialEntry>();
+            private readonly int[] _spatialBuckets = new int[256];
             private bool _spatialOrderDirty = true;
             private int _lastSpatialSortFrame = -1000;
             private bool _resize;
@@ -1014,6 +1617,9 @@ namespace LoogaSoft.Instancing
             private readonly HashSet<int> _moving = new();
             private readonly List<int> _uploadSlots = new();
             private readonly List<InstanceUploadSegment> _uploadSegments = new();
+            private readonly List<Vector2Int> _uploadRanges = new();
+            private const int UploadMergeGap = 64;
+            private static readonly float[] HeaderZeros = new float[16];
             private readonly InstanceUploadRing _uploadRing;
             private int _sourceFrame = -1;
             private int _appearanceOffset;
@@ -1023,6 +1629,11 @@ namespace LoogaSoft.Instancing
             private readonly SphericalHarmonicsL2[] _probeSH = new SphericalHarmonicsL2[1];
             private readonly Vector4[] _probeOcclusion = new Vector4[1];
             private int MatrixArrays => _previous == null ? 2 : 4;
+            // Draw part to shared data block, and data block to the draw part that supplies its values.
+            private readonly int[] _dataPart;
+            private readonly int[] _dataSource;
+            private int DataParts => _dataSource.Length;
+            internal int DataPartOf(int part) => _dataPart[part];
 
             private InstanceWindSource _wind;
             private NativeArray<Vector4> _windData;
@@ -1031,6 +1642,11 @@ namespace LoogaSoft.Instancing
             private int _registeredMeshes;
             private int _registeredMaterials;
             private readonly List<Material> _lightmapMaterials = new();
+            private readonly Material[] _baseMaterials;
+            private readonly Material[] _fadeMaterials;
+            private int _fadePartCount;
+            private float _appliedFadeStart = float.NaN;
+            private float _appliedFadeEnd = float.NaN;
             private readonly List<InstanceMaterialBinding> _materialBindings = new();
 
             internal long Bytes
@@ -1054,7 +1670,7 @@ namespace LoogaSoft.Instancing
             {
                 if (Capacity == 0) return 0;
                 int views = Mathf.Max(reservedViews, Views.Count);
-                long source = 64 + Capacity * (48L + Prototype.PartCount * (MatrixArrays * 48L +
+                long source = 64 + Capacity * (48L + DataParts * (MatrixArrays * 48L +
                     (_appearance == null ? 0 : 48L) + LightingFloats * 4L)) + (_wind == null ? 0 : _wind.PropertyIds.Length * 16L);
                 long visibility = views * (Prototype.PartCount * (long)BucketsPerPart * (Capacity * 4L + 20) + Capacity * 16L);
                 int streams = Prototype.AnimatedCrossFade ? 1 : 0;
@@ -1067,16 +1683,20 @@ namespace LoogaSoft.Instancing
                     ((Capacity + 63L) / 64) * 16 + Capacity * 4L);
             }
 
-            internal Population(InstancePrototype prototype, BatchRendererGroup group, ComputeShader shader, int patchKernel)
+            internal Population(InstancePrototype prototype, ComputeShader shader, int patchKernel,
+                bool staticTransforms, bool gpuResident)
             {
                 Prototype = prototype;
+                _gpuResident = gpuResident;
                 // Fully visible draws must not run the shader dither variant.
                 BucketsPerPart = prototype.CrossFade ? 4 : 2;
+                (_dataPart, _dataSource) = ShareInstanceData(prototype.Parts);
                 foreach (var part in prototype.Parts)
                 {
                     HasMeshLod |= part.MeshLevels > 1;
                     if (part.MeshLevels > 1) BucketsPerPart = 4;
-                    if (part.HasMotion && _previous == null)
+                    // Static transforms have no history. Previous-matrix metadata then reads the current matrices.
+                    if (part.HasMotion && _previous == null && !staticTransforms)
                     {
                         // BRG metadata is immutable for the lifetime of a batch. Reserve
                         // transform history before the first upload so the first moving
@@ -1084,7 +1704,6 @@ namespace LoogaSoft.Instancing
                         _previous = Array.Empty<Matrix4x4>();
                     }
                 }
-                _group = group;
                 _uploadRing = new InstanceUploadRing(shader, patchKernel);
                 var partData = new PartCullData[prototype.PartCount];
                 for (int index = 0; index < partData.Length; index++)
@@ -1095,7 +1714,9 @@ namespace LoogaSoft.Instancing
                         Header = new Vector4(part.Lod, part.Local.determinant < 0 ? 1 : 0,
                             part.MeshLevel, part.MeshLevels),
                         Selection = part.MeshSelection,
-                        Center = part.Mesh.bounds.center,
+                        // W holds the shared data block. Mesh LOD selection reads this part's transform from it.
+                        Center = new Vector4(part.Mesh.bounds.center.x, part.Mesh.bounds.center.y,
+                            part.Mesh.bounds.center.z, _dataPart[index]),
                         Extents = part.Mesh.bounds.extents
                     };
                 }
@@ -1105,6 +1726,8 @@ namespace LoogaSoft.Instancing
                 Meshes = new BatchMeshID[prototype.PartCount];
                 Materials = new BatchMaterialID[prototype.PartCount];
                 Batches = new BatchID[prototype.PartCount];
+                _baseMaterials = new Material[prototype.PartCount];
+                _fadeMaterials = new Material[prototype.PartCount];
                 try
                 {
                     _wind = prototype.Profile ? prototype.Profile.CreateWind(prototype.Source) : null;
@@ -1114,8 +1737,6 @@ namespace LoogaSoft.Instancing
                     }
                     for (int i = 0; i < prototype.PartCount; i++)
                     {
-                        Meshes[i] = group.RegisterMesh(prototype.Parts[i].Mesh);
-                        _registeredMeshes++;
                         var sourcePart = prototype.Parts[i];
                         Material drawMaterial = sourcePart.Material;
                         if (prototype.Profile)
@@ -1150,8 +1771,11 @@ namespace LoogaSoft.Instancing
                             else drawMaterial.DisableKeyword("DIRLIGHTMAP_COMBINED");
                             if (map.shadowMask) drawMaterial.EnableKeyword("SHADOWS_SHADOWMASK");
                         }
-                        Materials[i] = group.RegisterMaterial(drawMaterial);
-                        _registeredMaterials++;
+                        _baseMaterials[i] = drawMaterial;
+                    }
+                    if (gpuResident)
+                    {
+                        CreatePartTransforms();
                     }
                 }
                 catch
@@ -1166,6 +1790,94 @@ namespace LoogaSoft.Instancing
                 }
             }
 
+            // Parts with the same mesh, local transform, color and lightmap produce identical per-instance data.
+            // For example, mesh LOD levels of one renderer share one data block, and their batches read the same offsets.
+            private static (int[] DataPart, int[] DataSource) ShareInstanceData(InstancePrototype.Part[] parts)
+            {
+                var dataPart = new int[parts.Length];
+                var dataSource = new List<int>(parts.Length);
+                for (int part = 0; part < parts.Length; part++)
+                {
+                    dataPart[part] = -1;
+                    for (int data = 0; data < dataSource.Count; data++)
+                    {
+                        InstancePrototype.Part other = parts[dataSource[data]];
+                        if (other.Mesh == parts[part].Mesh && other.Local == parts[part].Local &&
+                            other.MaterialColor == parts[part].MaterialColor && other.LightmapIndex == parts[part].LightmapIndex &&
+                            other.LightmapST == parts[part].LightmapST)
+                        {
+                            dataPart[part] = data;
+                            break;
+                        }
+                    }
+                    if (dataPart[part] >= 0) continue;
+                    dataPart[part] = dataSource.Count;
+                    dataSource.Add(part);
+                }
+                return (dataPart, dataSource.ToArray());
+            }
+
+            internal bool PartHasMaterialViewFade(int part) => !ReferenceEquals(_fadeMaterials[part], null);
+
+            internal bool HasMaterialViewFade => _fadePartCount > 0;
+
+            internal bool AllMaterialViewFade => _fadePartCount == _fadeMaterials.Length;
+
+            internal void SetQuality(InstanceQualitySettings quality, float viewDistance)
+            {
+                Quality = quality;
+                SourceRevision++;
+                _appliedFadeStart = _appliedFadeEnd = float.NaN;
+                for (int part = 0; part < _baseMaterials.Length; part++)
+                {
+                    Material baseMaterial = _baseMaterials[part];
+                    bool useMaterialFade = (quality.ViewDistance > 0 || quality.ViewFadeDistance > 0) &&
+                        baseMaterial.GetTag("LoogaInstanceDistanceFade", false, string.Empty) == "Material" &&
+                        baseMaterial.HasProperty("_FadeStart") && baseMaterial.HasProperty("_FadeEnd");
+                    if (useMaterialFade == !ReferenceEquals(_fadeMaterials[part], null)) continue;
+                    if (_group != null)
+                    {
+                        _group.UnregisterMaterial(Materials[part]);
+                    }
+                    if (useMaterialFade)
+                    {
+                        Material clone = new Material(baseMaterial)
+                        {
+                            hideFlags = HideFlags.HideAndDontSave,
+                            name = baseMaterial.name + " (Looga distance fade)"
+                        };
+                        _fadeMaterials[part] = clone;
+                        _fadePartCount++;
+                    }
+                    else
+                    {
+                        UnityEngine.Object.DestroyImmediate(_fadeMaterials[part]);
+                        _fadeMaterials[part] = null;
+                        _fadePartCount--;
+                    }
+                    if (_group != null)
+                    {
+                        Materials[part] = _group.RegisterMaterial(DrawMaterial(part));
+                    }
+                }
+                UpdateMaterialFade(viewDistance);
+            }
+
+            internal void UpdateMaterialFade(float distance)
+            {
+                float start = Mathf.Max(0, distance - Quality.ViewFadeDistance);
+                if (_appliedFadeStart == start && _appliedFadeEnd == distance) return;
+                if (_fadePartCount == 0) return;
+                foreach (Material material in _fadeMaterials)
+                {
+                    if (!material) continue;
+                    material.SetFloat("_FadeStart", start);
+                    material.SetFloat("_FadeEnd", distance);
+                }
+                _appliedFadeStart = start;
+                _appliedFadeEnd = distance;
+            }
+
             internal void EnsureCapacity(int size)
             {
                 if (BucketsPerPart > 2 && size > 0x1000000)
@@ -1174,6 +1886,9 @@ namespace LoogaSoft.Instancing
                 }
                 if (size <= Capacity) return;
                 Capacity = Mathf.NextPowerOfTwo(Mathf.Max(64, size));
+                _resize = true;
+                // GPU-resident storage keeps no per-slot CPU arrays. The next commit copies slots on the GPU.
+                if (_gpuResident) return;
                 int cpuCapacity = Math.Max(Capacity, Transforms.Length);
                 Array.Resize(ref Transforms, cpuCapacity);
                 Array.Resize(ref Generations, cpuCapacity);
@@ -1200,11 +1915,16 @@ namespace LoogaSoft.Instancing
                         _appearance[i] = InstanceAppearance.Default;
                     }
                 }
-                _resize = true;
             }
 
             internal void TrimExcess()
             {
+                if (_gpuResident)
+                {
+                    TrimGpuStorage();
+                    return;
+                }
+                int previousHighWater = HighWater;
                 while (HighWater > 0 && !Active[HighWater - 1])
                 {
                     Dirty.Remove(--HighWater);
@@ -1212,6 +1932,11 @@ namespace LoogaSoft.Instancing
                 }
                 Free.Clear();
                 _spatialOrderDirty = true;
+                ClusterDirty = true;
+                if (HighWater < previousHighWater)
+                {
+                    _lastSpatialSortFrame = -1000;
+                }
                 for (int i = 0; i < HighWater; i++)
                 {
                     if (!Active[i])
@@ -1322,7 +2047,8 @@ namespace LoogaSoft.Instancing
                 Dirty.Add(slot);
             }
 
-            internal GraphicsBuffer GetHistory(BatchPackedCullingViewID id, LODParameters parameters, Vector3 forward, int part = -1)
+            internal GraphicsBuffer GetHistory(BatchPackedCullingViewID id, LODParameters parameters, Vector3 forward,
+                CommandBuffer cmd, ComputeShader shader, int clearKernel, int part = -1)
             {
                 var keyId = (id, part);
                 _expiredHistories.Clear();
@@ -1341,7 +2067,7 @@ namespace LoogaSoft.Instancing
                 if (!_histories.TryGetValue(keyId, out var history))
                 {
                     history = new TransitionHistory { Buffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Capacity, 16) };
-                    history.Buffer.SetData(new Vector4[Capacity]);
+                    ClearHistory(history.Buffer, Capacity, cmd, shader, clearKernel);
                     _histories.Add(keyId, history);
                 }
                 bool cut = history.LastFrame != 0 && (Time.frameCount - history.LastFrame > 1 ||
@@ -1352,12 +2078,35 @@ namespace LoogaSoft.Instancing
                     Vector3.Dot(forward.normalized, history.Forward.normalized) < 0.5f);
                 if (cut)
                 {
-                    history.Buffer.SetData(new Vector4[Capacity]);
+                    ClearHistory(history.Buffer, Capacity, cmd, shader, clearKernel);
                 }
                 history.Parameters = parameters;
                 history.Forward = forward;
                 history.LastFrame = Time.frameCount;
                 return history.Buffer;
+            }
+
+            // Zeros for history clears without the ClearHistory kernel. Shared and grown only, because a clear of a
+            // large population allocated Capacity * 16 bytes each time.
+            private static Vector4[] _historyZeros = Array.Empty<Vector4>();
+
+            // Clears a history before the cull reads it. The kernel clears on the GPU in the culling command buffer, so
+            // a cut does not copy and upload a population-sized buffer. Editor views cut their history on most renders.
+            private static void ClearHistory(GraphicsBuffer buffer, int count, CommandBuffer cmd, ComputeShader shader,
+                int clearKernel)
+            {
+                if (clearKernel >= 0)
+                {
+                    cmd.SetComputeIntParam(shader, "_ClearCount", count);
+                    cmd.SetComputeBufferParam(shader, clearKernel, "_LodHistory", buffer);
+                    cmd.DispatchCompute(shader, clearKernel, (count + 63) / 64, 1, 1);
+                    return;
+                }
+                if (_historyZeros.Length < count)
+                {
+                    _historyZeros = new Vector4[Mathf.NextPowerOfTwo(count)];
+                }
+                buffer.SetData(_historyZeros, 0, 0, count);
             }
 
             internal bool TryGetView(int index, out ViewBuffers view)
@@ -1375,74 +2124,96 @@ namespace LoogaSoft.Instancing
                 return Views[index];
             }
 
+            // Create source buffers and batches for the current capacity. Batch metadata offsets depend on capacity.
+            internal void CreateStorage()
+            {
+                if (_group == null)
+                {
+                    throw new InvalidOperationException("Instance storage requires an attached renderer group.");
+                }
+                int matrixFloats = DataParts * Capacity * 12;
+                _appearanceOffset = 16 + matrixFloats * MatrixArrays;
+                _lightingOffset = _appearanceOffset + (_appearance == null ? 0 : DataParts * Capacity * 12);
+                _windOffset = _lightingOffset + DataParts * Capacity * LightingFloats;
+                int length = _windOffset + (_wind == null ? 0 : _wind.PropertyIds.Length * 4);
+                _windFrame = -1;
+                _storageCapacity = Capacity;
+                // The upload compute shader requires a GPU-writable destination.
+                Buffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, length, 4);
+                BoundsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Capacity, 48);
+                SpatialOrder = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Capacity, 4);
+                if (_gpuResident)
+                {
+                    // The relayout pass fills bounds and spatial order. The header stays zero for BRG defaults.
+                    Buffer.SetData(HeaderZeros, 0, 0, 16);
+                }
+                else
+                {
+                    _packed = new float[length];
+                    _bounds = new GpuBounds[Capacity];
+                    SpatialOrder.SetData(_spatialOrder, 0, 0, Capacity);
+                    Buffer.SetData(_packed, 0, 0, 16);
+                }
+                for (int part = 0; part < Prototype.PartCount; part++)
+                {
+                    int data = _dataPart[part];
+                    var metadata = new NativeArray<MetadataValue>(4 + (Prototype.LegacyProbes ? 1 : 0) + (Prototype.HasLightmaps ? 1 : 0) + (_appearance == null ? 0 : 3) + (_wind == null ? 0 : _wind.PropertyIds.Length), Allocator.Temp);
+                    metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"),
+                        Value = 0x80000000u | (uint)((16 + data * Capacity * 12) * 4) };
+                    metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"),
+                        Value = 0x80000000u | (uint)((16 + matrixFloats + data * Capacity * 12) * 4) };
+                    metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("unity_MatrixPreviousM"),
+                        Value = 0x80000000u | (uint)((16 + (_previous == null ? 0 : matrixFloats * 2) + data * Capacity * 12) * 4) };
+                    metadata[3] = new MetadataValue { NameID = Shader.PropertyToID("unity_MatrixPreviousMI"),
+                        Value = 0x80000000u | (uint)((16 + (_previous == null ? matrixFloats : matrixFloats * 3) + data * Capacity * 12) * 4) };
+                    if (_appearance != null)
+                    {
+                        string[] names = { "_BaseColor", "_LoogaLightmapColor", "_LoogaInstanceData" };
+                        for (int channel = 0; channel < names.Length; channel++)
+                        {
+                            metadata[4 + channel] = new MetadataValue { NameID = Shader.PropertyToID(names[channel]),
+                                Value = 0x80000000u | (uint)((_appearanceOffset + (data * 3 + channel) * Capacity * 4) * 4) };
+                        }
+                    }
+                    if (_wind != null)
+                    {
+                        for (int i = 0; i < _wind.PropertyIds.Length; i++)
+                        {
+                            metadata[4 + (_appearance == null ? 0 : 3) + i] = new MetadataValue { NameID = _wind.PropertyIds[i], Value = (uint)(_windOffset * 4 + i * 16) };
+                        }
+                    }
+                    int lightingMetadata = metadata.Length - (Prototype.LegacyProbes ? 1 : 0) - (Prototype.HasLightmaps ? 1 : 0);
+                    if (Prototype.LegacyProbes)
+                    {
+                        metadata[lightingMetadata++] = new MetadataValue { NameID = Shader.PropertyToID("unity_SHCoefficients"),
+                            Value = 0x80000000u | (uint)((_lightingOffset + data * Capacity * LightingFloats) * 4) };
+                    }
+                    if (Prototype.HasLightmaps)
+                    {
+                        metadata[lightingMetadata] = new MetadataValue { NameID = Shader.PropertyToID("unity_LightmapST"),
+                            Value = 0x80000000u | (uint)((_lightingOffset + data * Capacity * LightingFloats + (Prototype.LegacyProbes ? Capacity * 32 : 0)) * 4) };
+                    }
+                    Batches[part] = _group.AddBatch(metadata, Buffer.bufferHandle);
+                    metadata.Dispose();
+                }
+            }
+
             internal long Upload(long budget)
             {
-                if (HighWater == 0 || budget < 64) return 0;
+                if (_gpuResident || HighWater == 0 || budget < 64) return 0;
                 long bytes = 0;
                 if (_resize)
                 {
                     ReleaseBuffers();
-                    int matrixFloats = Prototype.PartCount * Capacity * 12;
-                    _appearanceOffset = 16 + matrixFloats * MatrixArrays;
-                    _lightingOffset = _appearanceOffset + (_appearance == null ? 0 : Prototype.PartCount * Capacity * 12);
-                    _windOffset = _lightingOffset + Prototype.PartCount * Capacity * LightingFloats;
-                    _packed = new float[_windOffset + (_wind == null ? 0 : _wind.PropertyIds.Length * 4)];
-                    _windFrame = -1;
-                    _bounds = new GpuBounds[Capacity];
-                    Buffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite, _packed.Length, 4);
-                    BoundsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, GraphicsBuffer.UsageFlags.LockBufferForWrite, Capacity, 48);
-                    SpatialOrder = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Capacity, 4);
-                    SpatialOrder.SetData(_spatialOrder, 0, 0, Capacity);
-                    Buffer.SetData(_packed, 0, 0, 16);
+                    CreateStorage();
                     bytes += 64;
-                    for (int part = 0; part < Prototype.PartCount; part++)
-                    {
-                        var metadata = new NativeArray<MetadataValue>(4 + (Prototype.LegacyProbes ? 1 : 0) + (Prototype.HasLightmaps ? 1 : 0) + (_appearance == null ? 0 : 3) + (_wind == null ? 0 : _wind.PropertyIds.Length), Allocator.Temp);
-                        metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"),
-                            Value = 0x80000000u | (uint)((16 + part * Capacity * 12) * 4) };
-                        metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"),
-                            Value = 0x80000000u | (uint)((16 + matrixFloats + part * Capacity * 12) * 4) };
-                        metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("unity_MatrixPreviousM"),
-                            Value = 0x80000000u | (uint)((16 + (_previous == null ? 0 : matrixFloats * 2) + part * Capacity * 12) * 4) };
-                        metadata[3] = new MetadataValue { NameID = Shader.PropertyToID("unity_MatrixPreviousMI"),
-                            Value = 0x80000000u | (uint)((16 + (_previous == null ? matrixFloats : matrixFloats * 3) + part * Capacity * 12) * 4) };
-                        if (_appearance != null)
-                        {
-                            string[] names = { "_BaseColor", "_LoogaLightmapColor", "_LoogaInstanceData" };
-                            for (int channel = 0; channel < names.Length; channel++)
-                            {
-                                metadata[4 + channel] = new MetadataValue { NameID = Shader.PropertyToID(names[channel]),
-                                    Value = 0x80000000u | (uint)((_appearanceOffset + (part * 3 + channel) * Capacity * 4) * 4) };
-                            }
-                        }
-                        if (_wind != null)
-                        {
-                            for (int i = 0; i < _wind.PropertyIds.Length; i++)
-                            {
-                                metadata[4 + (_appearance == null ? 0 : 3) + i] = new MetadataValue { NameID = _wind.PropertyIds[i], Value = (uint)(_windOffset * 4 + i * 16) };
-                            }
-                        }
-                        int lightingMetadata = metadata.Length - (Prototype.LegacyProbes ? 1 : 0) - (Prototype.HasLightmaps ? 1 : 0);
-                        if (Prototype.LegacyProbes)
-                        {
-                            metadata[lightingMetadata++] = new MetadataValue { NameID = Shader.PropertyToID("unity_SHCoefficients"),
-                                Value = 0x80000000u | (uint)((_lightingOffset + part * Capacity * LightingFloats) * 4) };
-                        }
-                        if (Prototype.HasLightmaps)
-                        {
-                            metadata[lightingMetadata] = new MetadataValue { NameID = Shader.PropertyToID("unity_LightmapST"),
-                                Value = 0x80000000u | (uint)((_lightingOffset + part * Capacity * LightingFloats + (Prototype.LegacyProbes ? Capacity * 32 : 0)) * 4) };
-                        }
-                        Batches[part] = _group.AddBatch(metadata, Buffer.bufferHandle);
-                        metadata.Dispose();
-                    }
                     for (int slot = 0; slot < HighWater; slot++)
                     {
                         Dirty.Add(slot);
                     }
                     _resize = false;
                 }
-                long bytesPerSlot = 48L + Prototype.PartCount * (MatrixArrays * 48L + (_appearance == null ? 0 : 48L) + LightingFloats * 4L);
+                long bytesPerSlot = 48L + DataParts * (MatrixArrays * 48L + (_appearance == null ? 0 : 48L) + LightingFloats * 4L);
                 int limit = (int)Math.Min(Dirty.Count, (budget - bytes) / bytesPerSlot);
                 _uploadSlots.Clear();
                 foreach (int slot in Dirty)
@@ -1458,25 +2229,27 @@ namespace LoogaSoft.Instancing
                     Matrix4x4 transform = Transforms[slot];
                     Bounds bounds = InstancePrototype.TransformBounds(Prototype.Bounds, transform);
                     Vector3 lodCenter = transform.MultiplyPoint3x4(Prototype.LodCenter);
-                    float scale = Mathf.Max(transform.GetColumn(0).magnitude, transform.GetColumn(1).magnitude, transform.GetColumn(2).magnitude);
+                    // Two-argument calls avoid the params array overload, which allocates for each slot.
+                    float scale = Mathf.Max(transform.GetColumn(0).magnitude, Mathf.Max(transform.GetColumn(1).magnitude, transform.GetColumn(2).magnitude));
                     _bounds[slot] = new GpuBounds
                     {
                         Sphere = new Vector4(bounds.center.x, bounds.center.y, bounds.center.z, bounds.extents.magnitude),
                         Lod = new Vector4(lodCenter.x, lodCenter.y, lodCenter.z, Prototype.LodSize * scale),
                         State = new Vector4(Active[slot] && Visible[slot] ? 1 : 0, transform.determinant < 0 ? 1 : 0, Generations[slot], StableFraction(VisibilityKeys[slot]))
                     };
-                    for (int part = 0; part < Prototype.PartCount; part++)
+                    for (int data = 0; data < DataParts; data++)
                     {
+                        int part = _dataSource[data];
                         Matrix4x4 world = transform * Prototype.Parts[part].Local;
-                        Pack(world, 16 + (part * Capacity + slot) * 12);
-                        Pack(world.inverse, 16 + (Prototype.PartCount * Capacity + part * Capacity + slot) * 12);
+                        Pack(world, 16 + (data * Capacity + slot) * 12);
+                        Pack(world.inverse, 16 + (DataParts * Capacity + data * Capacity + slot) * 12);
                         if (_previous != null)
                         {
                             Matrix4x4 previous = _previous[slot] * Prototype.Parts[part].Local;
-                            Pack(previous, 16 + (Prototype.PartCount * Capacity * 2 + part * Capacity + slot) * 12);
-                            Pack(previous.inverse, 16 + (Prototype.PartCount * Capacity * 3 + part * Capacity + slot) * 12);
+                            Pack(previous, 16 + (DataParts * Capacity * 2 + data * Capacity + slot) * 12);
+                            Pack(previous.inverse, 16 + (DataParts * Capacity * 3 + data * Capacity + slot) * 12);
                         }
-                        int lighting = _lightingOffset + part * Capacity * LightingFloats;
+                        int lighting = _lightingOffset + data * Capacity * LightingFloats;
                         if (Prototype.LegacyProbes)
                         {
                             _probePositions[0] = world.MultiplyPoint3x4(Prototype.Parts[part].Mesh.bounds.center);
@@ -1495,20 +2268,23 @@ namespace LoogaSoft.Instancing
                         {
                             var value = _appearance[slot];
                             Color color = Prototype.Parts[part].MaterialColor * value.Tint;
-                            PackVector(QualitySettings.activeColorSpace == ColorSpace.Linear ? color.linear : color, _appearanceOffset + (part * 3 * Capacity + slot) * 4);
-                            PackVector(QualitySettings.activeColorSpace == ColorSpace.Linear ? value.LightmapColor.linear : value.LightmapColor, _appearanceOffset + ((part * 3 + 1) * Capacity + slot) * 4);
-                            PackVector(value.Custom, _appearanceOffset + ((part * 3 + 2) * Capacity + slot) * 4);
+                            PackVector(QualitySettings.activeColorSpace == ColorSpace.Linear ? color.linear : color, _appearanceOffset + (data * 3 * Capacity + slot) * 4);
+                            PackVector(QualitySettings.activeColorSpace == ColorSpace.Linear ? value.LightmapColor.linear : value.LightmapColor, _appearanceOffset + ((data * 3 + 1) * Capacity + slot) * 4);
+                            PackVector(value.Custom, _appearanceOffset + ((data * 3 + 2) * Capacity + slot) * 4);
                         }
                     }
                 }
                 if (_uploadSlots.Count > 0) ClusterDirty = true;
+                // Slot reuse scatters dirty slots. Merge small gaps into one range: gap slots already match
+                // GPU storage, so a second write is harmless and far cheaper than a separate upload call.
+                _uploadRanges.Clear();
                 int start = -1;
                 int end = -1;
                 foreach (int slot in _uploadSlots)
                 {
-                    if (start >= 0 && slot != end + 1)
+                    if (start >= 0 && slot - end - 1 > UploadMergeGap)
                     {
-                        bytes += UploadRange(start, end - start + 1);
+                        _uploadRanges.Add(new Vector2Int(start, end - start + 1));
                         start = -1;
                     }
                     if (start < 0)
@@ -1519,8 +2295,9 @@ namespace LoogaSoft.Instancing
                 }
                 if (start >= 0)
                 {
-                    bytes += UploadRange(start, end - start + 1);
+                    _uploadRanges.Add(new Vector2Int(start, end - start + 1));
                 }
+                bytes += UploadRanges();
                 foreach (int slot in _uploadSlots)
                 {
                     Dirty.Remove(slot);
@@ -1528,9 +2305,10 @@ namespace LoogaSoft.Instancing
                 return bytes;
             }
 
-            internal void PrepareSpatialOrder()
+            internal unsafe void PrepareSpatialOrder()
             {
-                if (!_spatialOrderDirty || Dirty.Count > 0 || HighWater == 0 || SpatialOrder == null)
+                // GPU-resident ranges keep identity order. Each range is already spatially coherent.
+                if (_gpuResident || !_spatialOrderDirty || Dirty.Count > 0 || HighWater == 0 || SpatialOrder == null)
                 {
                     return;
                 }
@@ -1539,44 +2317,24 @@ namespace LoogaSoft.Instancing
                 {
                     return;
                 }
-                Vector3 minimum = Vector3.positiveInfinity;
-                Vector3 maximum = Vector3.negativeInfinity;
-                for (int slot = 0; slot < HighWater; slot++)
+                if (_spatialEntries.Length < HighWater)
                 {
-                    if (!Active[slot]) continue;
-                    Vector3 center = _bounds[slot].Sphere;
-                    minimum = Vector3.Min(minimum, center);
-                    maximum = Vector3.Max(maximum, center);
+                    Array.Resize(ref _spatialEntries, Mathf.NextPowerOfTwo(HighWater));
+                    Array.Resize(ref _spatialScratch, _spatialEntries.Length);
                 }
-                if (!float.IsFinite(minimum.x))
+                fixed (GpuBounds* bounds = _bounds)
+                fixed (bool* active = Active)
+                fixed (SpatialEntry* entries = _spatialEntries)
+                fixed (SpatialEntry* scratch = _spatialScratch)
+                fixed (int* buckets = _spatialBuckets)
+                fixed (uint* order = _spatialOrder)
                 {
-                    return;
-                }
-                Array.Resize(ref _spatialEntries, HighWater);
-                Vector3 extent = maximum - minimum;
-                int entry = 0;
-                for (int slot = 0; slot < HighWater; slot++)
-                {
-                    if (!Active[slot]) continue;
-                    Vector3 normalized = new Vector3(
-                        extent.x > 0.0001f ? (_bounds[slot].Sphere.x - minimum.x) / extent.x : 0.5f,
-                        extent.y > 0.0001f ? (_bounds[slot].Sphere.y - minimum.y) / extent.y : 0.5f,
-                        extent.z > 0.0001f ? (_bounds[slot].Sphere.z - minimum.z) / extent.z : 0.5f);
-                    _spatialEntries[entry++] = new SpatialEntry
+                    // Direct call runs synchronously. Pinned arrays avoid copying the full population.
+                    if (SpatialOrderKernel.Execute(bounds, (byte*)active, entries, scratch,
+                            buckets, order, HighWater) == 0)
                     {
-                        Slot = (uint)slot,
-                        Code = Morton(normalized)
-                    };
-                }
-                for (int slot = 0; slot < HighWater; slot++)
-                {
-                    if (Active[slot]) continue;
-                    _spatialEntries[entry++] = new SpatialEntry { Slot = (uint)slot, Code = uint.MaxValue };
-                }
-                Array.Sort(_spatialEntries, 0, HighWater, SpatialEntryComparer.Instance);
-                for (int index = 0; index < HighWater; index++)
-                {
-                    _spatialOrder[index] = _spatialEntries[index].Slot;
+                        return;
+                    }
                 }
                 SpatialOrder.SetData(_spatialOrder, 0, 0, HighWater);
                 ClusterDirty = true;
@@ -1584,22 +2342,109 @@ namespace LoogaSoft.Instancing
                 _lastSpatialSortFrame = Time.frameCount;
             }
 
-            private static uint Morton(Vector3 normalized)
+            [BurstCompile]
+            private static class SpatialOrderKernel
             {
-                uint x = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.x * 1023f), 0, 1023);
-                uint y = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.y * 1023f), 0, 1023);
-                uint z = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.z * 1023f), 0, 1023);
-                return SpreadBits(x) | SpreadBits(y) << 1 | SpreadBits(z) << 2;
-            }
+                [BurstCompile(FloatMode = FloatMode.Strict, FloatPrecision = FloatPrecision.Standard)]
+                internal static unsafe int Execute(GpuBounds* bounds, byte* active,
+                    SpatialEntry* entries, SpatialEntry* scratch, int* buckets,
+                    uint* order, int count)
+                {
+                    float minX = float.PositiveInfinity;
+                    float minY = float.PositiveInfinity;
+                    float minZ = float.PositiveInfinity;
+                    float maxX = float.NegativeInfinity;
+                    float maxY = float.NegativeInfinity;
+                    float maxZ = float.NegativeInfinity;
+                    for (int slot = 0; slot < count; slot++)
+                    {
+                        if (active[slot] == 0) continue;
+                        Vector4 center = bounds[slot].Sphere;
+                        minX = math.min(minX, center.x);
+                        minY = math.min(minY, center.y);
+                        minZ = math.min(minZ, center.z);
+                        maxX = math.max(maxX, center.x);
+                        maxY = math.max(maxY, center.y);
+                        maxZ = math.max(maxZ, center.z);
+                    }
+                    if (!math.isfinite(minX)) return 0;
 
-            private static uint SpreadBits(uint value)
-            {
-                value &= 0x000003ff;
-                value = (value | value << 16) & 0x030000ff;
-                value = (value | value << 8) & 0x0300f00f;
-                value = (value | value << 4) & 0x030c30c3;
-                value = (value | value << 2) & 0x09249249;
-                return value;
+                    float extentX = maxX - minX;
+                    float extentY = maxY - minY;
+                    float extentZ = maxZ - minZ;
+                    int entryCount = 0;
+                    for (int slot = 0; slot < count; slot++)
+                    {
+                        if (active[slot] == 0) continue;
+                        Vector4 center = bounds[slot].Sphere;
+                        float x = extentX > 0.0001f ? (center.x - minX) / extentX : 0.5f;
+                        float y = extentY > 0.0001f ? (center.y - minY) / extentY : 0.5f;
+                        float z = extentZ > 0.0001f ? (center.z - minZ) / extentZ : 0.5f;
+                        entries[entryCount++] = new SpatialEntry
+                        {
+                            Slot = (uint)slot,
+                            Code = Morton(x, y, z)
+                        };
+                    }
+                    for (int slot = 0; slot < count; slot++)
+                    {
+                        if (active[slot] != 0) continue;
+                        entries[entryCount++] = new SpatialEntry { Slot = (uint)slot, Code = uint.MaxValue };
+                    }
+
+                    SpatialEntry* source = entries;
+                    SpatialEntry* destination = scratch;
+                    for (int shift = 0; shift < 32; shift += 8)
+                    {
+                        for (int bucket = 0; bucket < 256; bucket++)
+                        {
+                            buckets[bucket] = 0;
+                        }
+                        for (int index = 0; index < count; index++)
+                        {
+                            buckets[(source[index].Code >> shift) & 255]++;
+                        }
+                        int next = 0;
+                        for (int bucket = 0; bucket < 256; bucket++)
+                        {
+                            int size = buckets[bucket];
+                            buckets[bucket] = next;
+                            next += size;
+                        }
+                        for (int index = 0; index < count; index++)
+                        {
+                            SpatialEntry entry = source[index];
+                            destination[buckets[(entry.Code >> shift) & 255]++] = entry;
+                        }
+                        SpatialEntry* swap = source;
+                        source = destination;
+                        destination = swap;
+                    }
+                    // Four radix passes place the final stable order back in entries.
+                    for (int index = 0; index < count; index++)
+                    {
+                        order[index] = entries[index].Slot;
+                    }
+                    return 1;
+                }
+
+                private static uint Morton(float x, float y, float z)
+                {
+                    uint ix = (uint)math.clamp((int)math.floor(x * 1023f), 0, 1023);
+                    uint iy = (uint)math.clamp((int)math.floor(y * 1023f), 0, 1023);
+                    uint iz = (uint)math.clamp((int)math.floor(z * 1023f), 0, 1023);
+                    return SpreadBits(ix) | SpreadBits(iy) << 1 | SpreadBits(iz) << 2;
+                }
+
+                private static uint SpreadBits(uint value)
+                {
+                    value &= 0x000003ff;
+                    value = (value | value << 16) & 0x030000ff;
+                    value = (value | value << 8) & 0x0300f00f;
+                    value = (value | value << 4) & 0x030c30c3;
+                    value = (value | value << 2) & 0x09249249;
+                    return value;
+                }
             }
 
             internal long UpdateWind()
@@ -1611,41 +2456,48 @@ namespace LoogaSoft.Instancing
                 return _windData.Length * 16L;
             }
 
-            private long UploadRange(int start, int count)
+            // Upload every range with one ring patch. Bounds use one SetData call per range.
+            private long UploadRanges()
             {
-                UploadRangeCount++;
                 long mapped = 0;
                 long fallback = 0;
-                if (InstanceUploadWriter.TryWrite(BoundsBuffer, _bounds, start, start, count)) mapped += count * 48L;
-                else { BoundsBuffer.SetData(_bounds, start, start, count); fallback += count * 48L; }
                 _uploadSegments.Clear();
-                for (int array = 0; array < Prototype.PartCount * MatrixArrays; array++)
+                foreach (Vector2Int range in _uploadRanges)
                 {
-                    int offset = 16 + (array * Capacity + start) * 12;
-                    _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 12));
-                }
-                if (_appearance != null)
-                {
-                    for (int channel = 0; channel < Prototype.PartCount * 3; channel++)
+                    int start = range.x;
+                    int count = range.y;
+                    UploadRangeCount++;
+                    BoundsBuffer.SetData(_bounds, start, start, count);
+                    fallback += count * 48L;
+                    for (int array = 0; array < DataParts * MatrixArrays; array++)
                     {
-                        int offset = _appearanceOffset + (channel * Capacity + start) * 4;
-                        _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 4));
+                        int offset = 16 + (array * Capacity + start) * 12;
+                        _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 12));
+                    }
+                    if (_appearance != null)
+                    {
+                        for (int channel = 0; channel < DataParts * 3; channel++)
+                        {
+                            int offset = _appearanceOffset + (channel * Capacity + start) * 4;
+                            _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 4));
+                        }
+                    }
+                    for (int data = 0; data < DataParts; data++)
+                    {
+                        int lighting = _lightingOffset + data * Capacity * LightingFloats;
+                        if (Prototype.LegacyProbes)
+                        {
+                            int offset = lighting + start * 32;
+                            _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 32));
+                        }
+                        if (Prototype.HasLightmaps)
+                        {
+                            int offset = lighting + (Prototype.LegacyProbes ? Capacity * 32 : 0) + start * 4;
+                            _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 4));
+                        }
                     }
                 }
-                for (int part = 0; part < Prototype.PartCount; part++)
-                {
-                    int lighting = _lightingOffset + part * Capacity * LightingFloats;
-                    if (Prototype.LegacyProbes)
-                    {
-                        int offset = lighting + start * 32;
-                        _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 32));
-                    }
-                    if (Prototype.HasLightmaps)
-                    {
-                        int offset = lighting + (Prototype.LegacyProbes ? Capacity * 32 : 0) + start * 4;
-                        _uploadSegments.Add(new InstanceUploadSegment(offset, offset, count * 4));
-                    }
-                }
+                if (_uploadSegments.Count == 0) return 0;
                 if (_uploadRing.TryPatch(Buffer, _packed, _uploadSegments, out long patched)) mapped += patched;
                 else
                 {
@@ -1697,6 +2549,39 @@ namespace LoogaSoft.Instancing
                 }
             }
 
+            internal void AttachGroup(BatchRendererGroup group)
+            {
+                _group = group;
+                for (int part = 0; part < Prototype.PartCount; part++)
+                {
+                    Meshes[part] = group.RegisterMesh(Prototype.Parts[part].Mesh);
+                    _registeredMeshes++;
+                }
+                for (int part = 0; part < Prototype.PartCount; part++)
+                {
+                    Materials[part] = group.RegisterMaterial(DrawMaterial(part));
+                    _registeredMaterials++;
+                }
+            }
+
+            // The caller releases storage first, so no batch refers to the registered meshes and materials.
+            internal void DetachGroup()
+            {
+                if (_group == null) return;
+                for (int i = 0; i < _registeredMeshes; i++)
+                {
+                    _group.UnregisterMesh(Meshes[i]);
+                }
+                for (int i = 0; i < _registeredMaterials; i++)
+                {
+                    _group.UnregisterMaterial(Materials[i]);
+                }
+                _registeredMeshes = _registeredMaterials = 0;
+                _group = null;
+            }
+
+            private Material DrawMaterial(int part) => _fadeMaterials[part] ? _fadeMaterials[part] : _baseMaterials[part];
+
             private void ReleaseBuffers()
             {
                 if (Buffer != null)
@@ -1737,15 +2622,13 @@ namespace LoogaSoft.Instancing
                 {
                     _windData.Dispose();
                 }
-                for (int i = 0; i < _registeredMeshes; i++)
+                DetachGroup();
+                for (int part = 0; part < _fadeMaterials.Length; part++)
                 {
-                    _group.UnregisterMesh(Meshes[i]);
+                    if (_fadeMaterials[part]) UnityEngine.Object.DestroyImmediate(_fadeMaterials[part]);
+                    _fadeMaterials[part] = null;
                 }
-                for (int i = 0; i < _registeredMaterials; i++)
-                {
-                    _group.UnregisterMaterial(Materials[i]);
-                }
-                _registeredMeshes = _registeredMaterials = 0;
+                _fadePartCount = 0;
                 foreach (var material in _lightmapMaterials)
                 {
                     UnityEngine.Object.DestroyImmediate(material);
@@ -1757,23 +2640,13 @@ namespace LoogaSoft.Instancing
                 }
                 _materialBindings.Clear();
                 PartParameters?.Dispose();
+                _partTransforms?.Dispose();
             }
 
             private struct SpatialEntry
             {
                 internal uint Slot;
                 internal uint Code;
-            }
-
-            private sealed class SpatialEntryComparer : IComparer<SpatialEntry>
-            {
-                internal static readonly SpatialEntryComparer Instance = new();
-
-                public int Compare(SpatialEntry left, SpatialEntry right)
-                {
-                    int code = left.Code.CompareTo(right.Code);
-                    return code != 0 ? code : left.Slot.CompareTo(right.Slot);
-                }
             }
 
             private struct GpuBounds

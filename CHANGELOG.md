@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.1.0-preview.14
+
+- Add `InstanceSet`. It draws static placements of several prototypes through one `InstanceRenderer`, so each view
+  runs one culling callback instead of one for each container. `SetEntry(owner, prototype, placements)` replaces
+  the instances of one entry and uploads once. Other entries do not change. Placements have no IDs.
+- `VegetationWindField` gusts travel downwind as curved fronts instead of a fixed diagonal pattern. Add Gust Wavelength
+  (default 24 m) and Lean (default 0.5), set with `ConfigureWaves`, and the `_LoogaFieldWave` shader globals. Lean bends
+  part of the trunk amplitude steadily downwind, so all vegetation moves with the passing fronts. Displacement stays
+  within the material amplitudes. Materials without a field keep their local wind.
+- Add `VegetationGust` and `VegetationGustSheen` to the vegetation shader library. The sheen brightens and glosses the
+  upper part of the plants while the same gust front bends them, most where they bend away from the camera. It runs in
+  the fragment stage from the instance pivot, so it needs no extra interpolator. Zero sheen values change nothing.
+- Add `ShaderLibrary` with the vegetation shader contract: `VegetationDeformation.hlsl` (wind, wind field, interaction
+  and ground deformation), `VegetationLighting.hlsl` and the ground includes. They moved from Looga Terrain without
+  a change in behavior, so every Looga package and project shader can use one implementation.
+- `SceneInstanceProvider` finds nested source roots once per rebuild by walking each source's ancestors. The pairwise
+  check was quadratic: one provider with 10,741 roots took 78 s to rebuild, now 24 s.
+- Clear LOD transition histories on the GPU (`ClearHistory` kernel) instead of uploading a new `Vector4[Capacity]`.
+  Editor views cut their history on most renders, so large grass populations allocated up to 113 MB in one frame
+  and stalled on the copy. Culling shaders without the kernel fall back to a shared zero array.
+- Add `SceneInstanceProvider.TrackSourceChanges` (default on). Off skips the per-frame source check, which read the
+  hierarchy, transforms and material hashes of every root (about 90 ms per frame for 14,700 static roots).
+- Fix prototype sharing for rotated or scaled copies. Part transforms now come from the local transforms between the root
+  and the part, not from a world-space round trip. Before the fix, rounding gave each scattered copy (for example,
+  MicroVerse object outputs) its own prototype and draw commands.
+- Submit URP instance culling commands after culling and before shadow drawing.
+- Scope deferred work to cameras using the active visibility feature. Release abandoned camera work.
+- Keep dynamic view buffers, authored quality, and the compatibility path for other renderers.
+- Maintain world-cell counts incrementally and use stable radix ordering for spatial groups.
+- Run Morton ordering and stable radix sorting in a synchronous Burst direct call over pinned arrays, without changing spatial order policy or copying the population.
+- Rebuild spatial order after storage trimming so live instances remain visible.
+- Add grouped GPU appends for large populations, with compatibility kernels retained.
+- Expose streaming CPU timing and GPU culling stage samples for performance diagnosis.
+- Keep bounds in a default GPU buffer and upload changed ranges with SetData, avoiding repeated GPU reads from mapped upload storage.
+- A controlled 11-frame full-world editor capture reduced Looga Instances.Cull median GPU time from 75.282 ms to 1.189 ms.
+- Skip collider residency scans for containers outside every gameplay interest. Read resolved placements without a copy each frame.
+- Share per-instance data between draw parts with the same mesh, local transform, color and lightmap. Mesh LOD levels of one renderer now use one data block.
+- Add a static-transform renderer option. Static renderers keep no previous-frame matrices, and motion-vector metadata reads the current matrices.
+- Track dirty slots in an ordered bitset instead of a sorted set. Merge nearby dirty ranges into one ring patch for each upload.
+- Remove a per-slot array allocation from the upload scale calculation.
+- Add stable distance density falloff (`DensityFalloffDistance`, `FarDensity`) for decorative camera views. Shadow views keep the full population.
+- Static-transform renderers draw per-object motion vectors only for the finest LOD and mesh level.
+- Fix mesh LOD selection for shared data blocks. Each draw part now reads its transform from its shared block.
+  Before the fix, mesh LOD 1 read the inverse matrix, and near instances drew both mesh levels.
+- Add GPU-resident renderers (`gpuResident` constructor option). The CPU tracks slot ranges only.
+  `AllocateRange`, `WriteRanges` and `ReleaseRange` let a compute pass write transforms into instance storage.
+  Culling, LOD selection and draw commands are unchanged. Capacity changes copy slots on the GPU.
+- Compact GPU-resident storage when free slots below the high-water mark exceed a quarter of the live slots.
+  A GPU pass moves written ranges together. Range handles use stable identifiers and stay valid.
+- Create the BatchRendererGroup only while a renderer has storage, and release it when every population is empty.
+  Unity calls every group for every culling view, so empty renderers now cost no culling callback.
+- Add CPU profiler markers `Looga.Cull <content kind>` around each culling callback.
+
+## [0.1.0-preview.13] - 2026-09-23
+
+- Add per-prototype view range, view fade, LOD bias, and shadow mode policies.
+- Support material-owned distance fade for tagged shaders and stable instance thinning for other shaders.
+- Expose resident counts and on-demand unique camera visibility counts.
+- Preserve source materials and placement buffers during quality changes.
+
+
+## Unreleased
+
+- Use a GPU-writable destination for compute-patched instance transforms. This fixes missing or stretched instances on Direct3D 12.
+
 ## 0.1.0-preview.12 - 2026-09-19
 
 - Add an opt-in frame-time controller for derived instance quality.

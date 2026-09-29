@@ -353,6 +353,125 @@ namespace LoogaSoft.Instancing.Tests
             internal Vector4 Extents;
         }
 
+        // Mesh LOD parts share one data block. Each part must read the block that holds its transform.
+        [TestCase(false)]
+        [TestCase(true)]
+        public void SharedDataPartsSelectMeshLevelFromTheirDataBlock(bool fusedParts)
+        {
+            const int count = 2;
+            const int partCount = 2;
+            const int buckets = 4;
+            var shader = Object.Instantiate(Resources.Load<ComputeShader>("LoogaInstanceCulling"));
+            using var bounds = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 48);
+            using var selection = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 16);
+            using var visible = new GraphicsBuffer(GraphicsBuffer.Target.Raw, partCount * buckets * count, 4);
+            using var arguments = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.IndirectArguments,
+                partCount * buckets * 5, 4);
+            using var history = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, 16);
+            using var instances = new GraphicsBuffer(GraphicsBuffer.Target.Raw, 16 + 2 * count * 12, 4);
+            using var parts = new GraphicsBuffer(GraphicsBuffer.Target.Structured, partCount, 64);
+            try
+            {
+                // Instance 0 is near and large, so it selects mesh level 0. Its inverse matrix selects level 1.
+                // Instance 1 is far and small, so it selects mesh level 1.
+                Matrix4x4[] transforms =
+                {
+                    Matrix4x4.TRS(new Vector3(6, 0, 0), Quaternion.identity, Vector3.one * 4),
+                    Matrix4x4.TRS(new Vector3(4, 0, 0), Quaternion.identity, Vector3.one * 0.5f)
+                };
+                var packed = new float[16 + 2 * count * 12];
+                for (int slot = 0; slot < count; slot++)
+                {
+                    PackMatrix(packed, 16 + slot * 12, transforms[slot]);
+                    PackMatrix(packed, 16 + (count + slot) * 12, transforms[slot].inverse);
+                }
+                instances.SetData(packed);
+                bounds.SetData(Enumerable.Range(0, count).Select(index => new BoundsRecord
+                {
+                    State = new Vector4(1, 0, 1, 0)
+                }).ToArray());
+                selection.SetData(Enumerable.Repeat(new Vector4(1, 1, 0.5f, 0), count).ToArray());
+                var meshSelection = new Vector4(1, 0, 0, -1);
+                var extents = new Vector4(0.5f, 0.5f, 0.5f, 0);
+                parts.SetData(new[]
+                {
+                    new PartRecord { Header = new Vector4(0, 0, 0, 2), Selection = meshSelection, Extents = extents },
+                    new PartRecord { Header = new Vector4(0, 0, 1, 2), Selection = meshSelection, Extents = extents }
+                });
+                arguments.SetData(new uint[partCount * buckets * 5]);
+                shader.SetInt("_Count", count);
+                shader.SetInt("_Capacity", count);
+                shader.SetInt("_BucketStride", buckets);
+                shader.SetInt("_PartCount", partCount);
+                shader.SetInt("_SelectionMode", 1);
+                shader.SetInt("_LodCount", 1);
+                shader.SetInt("_CrossFade", 0);
+                shader.SetInt("_PercentageLods", 0);
+                shader.SetInt("_AnimatedFade", 0);
+                shader.SetInt("_MeshFade", 0);
+                shader.SetInt("_PartMaterialFade", 0);
+                shader.SetFloat("_MeshMetric", 1);
+                shader.SetVector("_Camera", Vector4.zero);
+                shader.SetVector("_Lod", Vector4.zero);
+                shader.SetVector("_Quality", new Vector4(1, 0, 0, 1));
+                shader.SetVector("_ViewFade", Vector4.zero);
+                shader.SetVectorArray("_Thresholds", new[] { new Vector4(0.2f, 0, 0, 0), Vector4.zero });
+                shader.SetVectorArray("_FadeWidths", new[] { Vector4.zero, Vector4.zero });
+                int kernel = shader.FindKernel(fusedParts ? "CullParts" : "Cull");
+                shader.SetBuffer(kernel, "_Bounds", bounds);
+                shader.SetBuffer(kernel, "_Selection", selection);
+                shader.SetBuffer(kernel, "_Visible", visible);
+                shader.SetBuffer(kernel, "_Arguments", arguments);
+                shader.SetBuffer(kernel, "_LodHistory", history);
+                shader.SetBuffer(kernel, "_MeshHistory", history);
+                shader.SetBuffer(kernel, "_InstanceData", instances);
+                if (fusedParts)
+                {
+                    shader.SetBuffer(kernel, "_PartParameters", parts);
+                    shader.Dispatch(kernel, 1, partCount, 1);
+                }
+                else
+                {
+                    for (int part = 0; part < partCount; part++)
+                    {
+                        shader.SetInt("_Part", part);
+                        shader.SetInt("_PartData", 0);
+                        shader.SetInt("_PartLod", 0);
+                        shader.SetInt("_PartFlip", 0);
+                        shader.SetInt("_MeshLevel", part);
+                        shader.SetInt("_MeshLevels", 2);
+                        shader.SetVector("_MeshSelection", meshSelection);
+                        shader.SetVector("_MeshCenter", Vector4.zero);
+                        shader.SetVector("_MeshExtents", extents);
+                        shader.Dispatch(kernel, 1, 1, 1);
+                    }
+                }
+                var counts = new uint[partCount * buckets * 5];
+                var indices = new uint[partCount * buckets * count];
+                arguments.GetData(counts);
+                visible.GetData(indices);
+                Assert.AreEqual(1u, counts[1], "Mesh level 0 must draw only the near instance.");
+                Assert.AreEqual(0u, indices[0] & 0x00ffffffu);
+                Assert.AreEqual(1u, counts[buckets * 5 + 1], "Mesh level 1 must draw only the far instance.");
+                Assert.AreEqual(1u, indices[buckets * count] & 0x00ffffffu);
+            }
+            finally
+            {
+                Object.DestroyImmediate(shader);
+            }
+        }
+
+        private static void PackMatrix(float[] target, int offset, Matrix4x4 matrix)
+        {
+            for (int column = 0; column < 4; column++)
+            {
+                for (int row = 0; row < 3; row++)
+                {
+                    target[offset++] = matrix[row, column];
+                }
+            }
+        }
+
         [Test]
         public void DecorativeReductionsRejectGameplayAndColliderSources()
         {

@@ -3,11 +3,110 @@ using LoogaSoft.Instancing.Editor;
 using NUnit.Framework;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace LoogaSoft.Instancing.Tests
 {
     public sealed class SharedArchitectureTests
     {
+        [Test]
+        public void DeferredCullCommandsKeepCameraOrderAndOwnership()
+        {
+            var first = new GameObject("First culling camera").AddComponent<Camera>();
+            var second = new GameObject("Second culling camera").AddComponent<Camera>();
+            var owner = new InstanceRenderer();
+            var feature = new object();
+            var seen = new System.Collections.Generic.List<string>();
+            try
+            {
+                var unsupported = CommandBufferPool.Get("unsupported");
+                try
+                {
+                    Assert.IsFalse(InstanceCullScheduler.TryQueue(owner, first, default, unsupported));
+                }
+                finally
+                {
+                    CommandBufferPool.Release(unsupported);
+                }
+
+                InstanceCullScheduler.Begin(first, feature);
+                InstanceCullScheduler.Begin(second, feature);
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(owner, first, default, CommandBufferPool.Get("first 1")));
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(owner, second, default, CommandBufferPool.Get("second")));
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(owner, first, default, CommandBufferPool.Get("first 2")));
+
+                Assert.AreEqual(1, InstanceCullScheduler.Drain(second, feature, (_, commands) => seen.Add(commands.name)));
+                CollectionAssert.AreEqual(new[] { "second" }, seen);
+                Assert.AreEqual(2, InstanceCullScheduler.Drain(first, feature, (_, commands) => seen.Add(commands.name)));
+                CollectionAssert.AreEqual(new[] { "second", "first 1", "first 2" }, seen);
+                Assert.AreEqual(0, InstanceCullScheduler.Drain(first, feature, (_, commands) => seen.Add(commands.name)));
+            }
+            finally
+            {
+                InstanceCullScheduler.Cancel(first);
+                InstanceCullScheduler.Cancel(second);
+                owner.Dispose();
+                Object.DestroyImmediate(first.gameObject);
+                Object.DestroyImmediate(second.gameObject);
+            }
+        }
+
+        [Test]
+        public void DisposingRendererKeepsOtherOwnerWork()
+        {
+            var camera = new GameObject("Shared culling camera").AddComponent<Camera>();
+            var first = new InstanceRenderer();
+            var second = new InstanceRenderer();
+            var feature = new object();
+            var seen = new System.Collections.Generic.List<string>();
+            try
+            {
+                InstanceCullScheduler.Begin(camera, feature);
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(first, camera, default, CommandBufferPool.Get("first owner")));
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(second, camera, default, CommandBufferPool.Get("second owner")));
+                first.Dispose();
+                Assert.AreEqual(1, InstanceCullScheduler.Drain(camera, feature, (_, commands) => seen.Add(commands.name)));
+                CollectionAssert.AreEqual(new[] { "second owner" }, seen);
+            }
+            finally
+            {
+                InstanceCullScheduler.Cancel(camera);
+                first.Dispose();
+                second.Dispose();
+                Object.DestroyImmediate(camera.gameObject);
+            }
+        }
+
+        [Test]
+        public void FeatureCancellationKeepsOtherFeatureScopes()
+        {
+            var firstCamera = new GameObject("First feature camera").AddComponent<Camera>();
+            var secondCamera = new GameObject("Second feature camera").AddComponent<Camera>();
+            var owner = new InstanceRenderer();
+            var firstFeature = new object();
+            var secondFeature = new object();
+            var seen = new System.Collections.Generic.List<string>();
+            try
+            {
+                InstanceCullScheduler.Begin(firstCamera, firstFeature);
+                InstanceCullScheduler.Begin(secondCamera, secondFeature);
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(owner, firstCamera, default, CommandBufferPool.Get("first feature")));
+                Assert.IsTrue(InstanceCullScheduler.TryQueue(owner, secondCamera, default, CommandBufferPool.Get("second feature")));
+                Assert.AreEqual(1, InstanceCullScheduler.CancelFeature(firstFeature));
+                Assert.AreEqual(0, InstanceCullScheduler.Drain(firstCamera, firstFeature, (_, commands) => seen.Add(commands.name)));
+                Assert.AreEqual(1, InstanceCullScheduler.Drain(secondCamera, secondFeature, (_, commands) => seen.Add(commands.name)));
+                CollectionAssert.AreEqual(new[] { "second feature" }, seen);
+            }
+            finally
+            {
+                InstanceCullScheduler.Cancel(firstCamera);
+                InstanceCullScheduler.Cancel(secondCamera);
+                owner.Dispose();
+                Object.DestroyImmediate(firstCamera.gameObject);
+                Object.DestroyImmediate(secondCamera.gameObject);
+            }
+        }
+
         [TestCase(0)]
         [TestCase(1)]
         public void MeshLodDrawRangeIncludesSubmeshOffset(int level)

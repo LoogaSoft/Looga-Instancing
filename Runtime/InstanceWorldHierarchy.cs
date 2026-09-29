@@ -144,17 +144,25 @@ namespace LoogaSoft.Instancing
         public InstanceHierarchyDecision Evaluate(Vector4[] planes, int planeCount, Vector3 camera,
             float maximumDistance, bool occlusionAvailable, InstanceVisibilityMode requested)
         {
+            return Evaluate(planes, planeCount, camera, maximumDistance, occlusionAvailable, requested, 0);
+        }
+
+        /// <summary>Include transformed instance bounds beyond placement positions in coarse visibility.</summary>
+        public InstanceHierarchyDecision Evaluate(Vector4[] planes, int planeCount, Vector3 camera,
+            float maximumDistance, bool occlusionAvailable, InstanceVisibilityMode requested,
+            float boundsPadding)
+        {
             int visibleRegions = 0, testedCells = 0, visibleCells = 0, candidates = 0;
             float maximumDistanceSquared = float.IsPositiveInfinity(maximumDistance) ? float.PositiveInfinity : maximumDistance * maximumDistance;
             foreach (Region region in _regions)
             {
-                if (!Visible(region.Bounds, planes, planeCount, camera, maximumDistanceSquared)) continue;
+                if (!Visible(region.Bounds, planes, planeCount, camera, maximumDistanceSquared, boundsPadding)) continue;
                 visibleRegions++;
                 for (int index = region.Begin; index < region.Begin + region.Count; index++)
                 {
                     Cell cell = _cells[index];
                     testedCells++;
-                    if (!Visible(cell.Bounds, planes, planeCount, camera, maximumDistanceSquared)) continue;
+                    if (!Visible(cell.Bounds, planes, planeCount, camera, maximumDistanceSquared, boundsPadding)) continue;
                     visibleCells++;
                     candidates = checked(candidates + cell.Count);
                 }
@@ -177,8 +185,10 @@ namespace LoogaSoft.Instancing
         /// <summary>True when a population is large enough to amortize temporal Hi-Z.</summary>
         public bool ShouldUseOcclusion(int candidates) => candidates >= _settings.OcclusionInstances;
 
-        private static bool Visible(Bounds bounds, Vector4[] planes, int count, Vector3 camera, float maximumDistanceSquared)
+        private static bool Visible(Bounds bounds, Vector4[] planes, int count, Vector3 camera,
+            float maximumDistanceSquared, float boundsPadding)
         {
+            bounds.Expand(2 * Mathf.Max(0, boundsPadding));
             Vector3 nearest = bounds.ClosestPoint(camera);
             if ((nearest - camera).sqrMagnitude > maximumDistanceSquared) return false;
             Vector3 center = bounds.center;

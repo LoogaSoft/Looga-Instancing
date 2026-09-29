@@ -1,6 +1,6 @@
 {
   "name": "com.loogasoft.loogainstancing",
-  "version": "0.1.0-preview.12",
+  "version": "0.1.0-preview.14",
   "displayName": "Looga Instancing",
   "description": "Shared BRG mesh rendering, authoring, instance streaming and interaction for Looga products.",
   "unity": "6000.3",

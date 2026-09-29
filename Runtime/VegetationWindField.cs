@@ -22,14 +22,21 @@ namespace LoogaSoft.Instancing
         [SerializeField, Range(0, 1)] private float _strength = 1;
         [SerializeField, Range(0, 1)] private float _gustAmplitude = 0.25f;
         [SerializeField, Min(0)] private float _gustFrequency = 0.5f;
+        [SerializeField, Min(1), Tooltip("Distance between gust fronts in meters. The fronts travel downwind at " +
+            "Gust Frequency x Gust Wavelength / 2 pi meters per second.")]
+        private float _gustWavelength = 24;
+        [SerializeField, Range(0, 1), Tooltip("Part of the trunk amplitude that bends steadily downwind. The rest sways.")]
+        private float _lean = 0.5f;
         [SerializeField] private Volume[] _volumes = Array.Empty<Volume>();
         private static VegetationWindField _owner;
         private static bool _subscribed;
         private static int _frame = -1;
         private static Vector4 _currentDirection;
         private static Vector4 _currentGust;
+        private static Vector4 _currentWave;
         private static Vector4 _previousDirection;
         private static Vector4 _previousGust;
+        private static Vector4 _previousWave;
         private static int _count;
         private static int _previousCount;
         private static readonly Vector4[] _positions = new Vector4[8];
@@ -106,6 +113,21 @@ namespace LoogaSoft.Instancing
             }
         }
 
+        /// <summary>Set the distance between gust fronts in meters and the steady downwind part of the trunk bend.</summary>
+        public void ConfigureWaves(float gustWavelength, float lean)
+        {
+            if (!float.IsFinite(gustWavelength) || !float.IsFinite(lean))
+            {
+                throw new ArgumentException("Wave parameters must be finite.");
+            }
+            _gustWavelength = Mathf.Max(1, gustWavelength);
+            _lean = Mathf.Clamp01(lean);
+            if (_owner == this)
+            {
+                Publish();
+            }
+        }
+
         private static void BeforeCamera(ScriptableRenderContext context, Camera camera)
         {
             Publish();
@@ -120,6 +142,7 @@ namespace LoogaSoft.Instancing
         {
             _previousDirection = _currentDirection;
             _previousGust = _currentGust;
+            _previousWave = _currentWave;
             _previousCount = _count;
             Array.Copy(_positions, _oldPositions, 8);
             Array.Copy(_directions, _oldDirections, 8);
@@ -135,12 +158,15 @@ namespace LoogaSoft.Instancing
             _count = 0;
             _currentDirection = Vector4.zero;
             _currentGust = Vector4.zero;
+            _currentWave = Vector4.zero;
             if (_owner)
             {
                 var direction = Finite(_owner._direction) ? _owner._direction.normalized : Vector3.zero;
                 _currentDirection = new Vector4(direction.x, direction.y, direction.z, 1);
                 _currentGust = new Vector4(SafeUnit(_owner._strength), SafeUnit(_owner._gustAmplitude),
                     float.IsFinite(_owner._gustFrequency) ? Mathf.Max(0, _owner._gustFrequency) : 0, 0);
+                _currentWave = new Vector4(float.IsFinite(_owner._gustWavelength) ? Mathf.Max(1, _owner._gustWavelength) : 24,
+                    SafeUnit(_owner._lean), 0, 0);
                 foreach (var volume in _owner._volumes ?? Array.Empty<Volume>())
                 {
                     if (_count == 8)
@@ -170,6 +196,8 @@ namespace LoogaSoft.Instancing
             Shader.SetGlobalVector("_LoogaFieldGust", _currentGust);
             Shader.SetGlobalVector("_LoogaFieldPreviousDirection", _previousDirection);
             Shader.SetGlobalVector("_LoogaFieldPreviousGust", _previousGust);
+            Shader.SetGlobalVector("_LoogaFieldWave", _currentWave);
+            Shader.SetGlobalVector("_LoogaFieldPreviousWave", _previousWave);
             Shader.SetGlobalInteger("_LoogaFieldVolumeCount", _count);
             Shader.SetGlobalInteger("_LoogaFieldPreviousVolumeCount", _previousCount);
             Shader.SetGlobalVectorArray("_LoogaFieldPositions", _positions);
@@ -189,7 +217,7 @@ namespace LoogaSoft.Instancing
             _subscribed = false;
             _frame = -1;
             _count = _previousCount = 0;
-            _currentDirection = _previousDirection = _currentGust = _previousGust = Vector4.zero;
+            _currentDirection = _previousDirection = _currentGust = _previousGust = _currentWave = _previousWave = Vector4.zero;
             Upload();
         }
     }

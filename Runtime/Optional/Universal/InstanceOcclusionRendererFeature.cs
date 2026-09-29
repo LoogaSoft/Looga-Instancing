@@ -61,8 +61,15 @@ namespace LoogaSoft.Instancing.Universal
             };
         }
 
+        public override void OnCameraPreCull(ScriptableRenderer renderer, in CameraData cameraData)
+        {
+            InstanceCullScheduler.Begin(cameraData.camera, this);
+        }
+
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData data)
         {
+            // URP calls this after context.Cull and before it draws shadow casters.
+            InstanceCullScheduler.Flush(data.cameraData.camera, this);
             var camera = data.cameraData;
             Camera source = camera.camera;
             Camera scope = source;
@@ -98,6 +105,7 @@ namespace LoogaSoft.Instancing.Universal
 
         protected override void Dispose(bool disposing)
         {
+            InstanceCullScheduler.CancelFeature(this);
             _sharedLease?.Dispose();
             _sharedLease = null;
             _lease?.Dispose();

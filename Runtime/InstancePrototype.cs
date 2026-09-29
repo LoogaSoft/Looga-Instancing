@@ -210,7 +210,7 @@ namespace LoogaSoft.Instancing
                     {
                         throw new NotSupportedException("Each submesh needs one material and a valid MeshFilter.");
                     }
-                    Matrix4x4 local = prefab.transform.worldToLocalMatrix * source.transform.localToWorldMatrix;
+                    Matrix4x4 local = RelativeMatrix(prefab.transform, source.transform);
                     float windPadding = profile ? profile.BoundsPadding : 0;
                     if (!float.IsFinite(windPadding) || windPadding < 0)
                     {
@@ -354,6 +354,23 @@ namespace LoogaSoft.Instancing
                 child = child.parent;
             }
             return true;
+        }
+
+        /// <summary>
+        /// Returns the transform of a child relative to a root from the local transforms between them.
+        /// </summary>
+        /// <remarks>
+        /// Copies of one hierarchy give identical matrices at any root position, rotation and scale, so they can share a
+        /// prototype. A round trip through world space adds rounding errors from the root transform.
+        /// </remarks>
+        internal static Matrix4x4 RelativeMatrix(Transform root, Transform child)
+        {
+            Matrix4x4 local = Matrix4x4.identity;
+            for (Transform current = child; current != root; current = current.parent)
+            {
+                local = Matrix4x4.TRS(current.localPosition, current.localRotation, current.localScale) * local;
+            }
+            return local;
         }
 
         internal static Bounds TransformBounds(Bounds bounds, Matrix4x4 matrix)

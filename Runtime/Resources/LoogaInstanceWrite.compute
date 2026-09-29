@@ -1,0 +1,179 @@
+#pragma kernel WriteRanges
+#pragma kernel ClearRanges
+#pragma kernel InitializeStorage
+#pragma kernel MoveRanges
+#pragma target 5.0
+
+// GPU-resident storage. The layout matches the CPU upload path in InstanceRenderer.Population.
+// Matrix array a, slot s starts at float (16 + (a * capacity + s) * 12). Each matrix stores four columns of three rows.
+
+struct InstanceBounds
+{
+    float4 sphere;
+    float4 lod;
+    float4 state; // Active, winding flip, generation, stable visibility fraction.
+};
+
+struct SourceTransform
+{
+    float4 row0;
+    float4 row1;
+    float4 row2;
+};
+
+struct Affine
+{
+    float3x3 rotation;
+    float3 translation;
+};
+
+StructuredBuffer<SourceTransform> _WriteSource;
+StructuredBuffer<uint4> _WriteRanges; // Source offset, first slot, count, generation.
+StructuredBuffer<float4> _WriteParts; // Six rows for each data part: local matrix, then inverse local matrix.
+StructuredBuffer<uint4> _ClearRanges; // First slot, count, unused, unused.
+StructuredBuffer<uint4> _MoveRanges; // Source slot, destination slot, count, unused.
+RWByteAddressBuffer _WriteData;
+RWStructuredBuffer<InstanceBounds> _WriteBounds;
+RWStructuredBuffer<uint> _WriteSpatialOrder;
+ByteAddressBuffer _RelayoutData;
+StructuredBuffer<InstanceBounds> _RelayoutBounds;
+int _WriteCapacity;
+int _WriteDataParts;
+int _WriteRangeCount;
+float4 _WriteBoundsCenter;
+float4 _WriteBoundsExtents;
+float4 _WriteLodCenter; // xyz: prototype LOD center. w: prototype LOD size.
+int _RelayoutCapacity;
+int _RelayoutArrays;
+
+uint Hash(uint value)
+{
+    value ^= value >> 16; value *= 0x7feb352du; value ^= value >> 15;
+    value *= 0x846ca68bu; return value ^ (value >> 16);
+}
+
+float StableFraction(uint value)
+{
+    return (Hash(value) & 0x00ffffffu) / 16777216.0;
+}
+
+Affine Multiply(Affine a, Affine b)
+{
+    Affine result;
+    result.rotation = mul(a.rotation, b.rotation);
+    result.translation = mul(a.rotation, b.translation) + a.translation;
+    return result;
+}
+
+Affine Invert(Affine value, float determinant)
+{
+    float3 x = value.rotation[0];
+    float3 y = value.rotation[1];
+    float3 z = value.rotation[2];
+    Affine result;
+    result.rotation = transpose(float3x3(cross(y, z), cross(z, x), cross(x, y))) / determinant;
+    result.translation = -mul(result.rotation, value.translation);
+    return result;
+}
+
+Affine LoadPart(uint index)
+{
+    Affine result;
+    float4 row0 = _WriteParts[index];
+    float4 row1 = _WriteParts[index + 1];
+    float4 row2 = _WriteParts[index + 2];
+    result.rotation = float3x3(row0.xyz, row1.xyz, row2.xyz);
+    result.translation = float3(row0.w, row1.w, row2.w);
+    return result;
+}
+
+void StoreMatrix(uint array, uint slot, Affine value)
+{
+    uint address = (16 + (array * (uint)_WriteCapacity + slot) * 12) * 4;
+    float3x3 r = value.rotation;
+    _WriteData.Store4(address, asuint(float4(r[0][0], r[1][0], r[2][0], r[0][1])));
+    _WriteData.Store4(address + 16, asuint(float4(r[1][1], r[2][1], r[0][2], r[1][2])));
+    _WriteData.Store4(address + 32, asuint(float4(r[2][2], value.translation)));
+}
+
+// Group y selects the range. Group x covers the instances of that range.
+[numthreads(64, 1, 1)]
+void WriteRanges(uint3 id : SV_DispatchThreadID)
+{
+    if (id.y >= (uint)_WriteRangeCount) return;
+    uint4 range = _WriteRanges[id.y];
+    if (id.x >= range.z) return;
+    uint slot = range.y + id.x;
+    SourceTransform source = _WriteSource[range.x + id.x];
+    Affine transform;
+    transform.rotation = float3x3(source.row0.xyz, source.row1.xyz, source.row2.xyz);
+    transform.translation = float3(source.row0.w, source.row1.w, source.row2.w);
+    float determinant = dot(transform.rotation[0], cross(transform.rotation[1], transform.rotation[2]));
+    bool finite = all(isfinite(source.row0)) && all(isfinite(source.row1)) && all(isfinite(source.row2));
+    // Zero or invalid transforms are inactive slots. Culling never reads their matrices.
+    if (!finite || abs(determinant) < 0.000001)
+    {
+        _WriteBounds[slot] = (InstanceBounds)0;
+        return;
+    }
+    float3x3 r = transform.rotation;
+    InstanceBounds bounds;
+    float3 center = mul(r, _WriteBoundsCenter.xyz) + transform.translation;
+    float3 extents = mul(abs(r), _WriteBoundsExtents.xyz);
+    bounds.sphere = float4(center, length(extents));
+    float scale = max(length(float3(r[0][0], r[1][0], r[2][0])),
+        max(length(float3(r[0][1], r[1][1], r[2][1])), length(float3(r[0][2], r[1][2], r[2][2]))));
+    bounds.lod = float4(mul(r, _WriteLodCenter.xyz) + transform.translation, _WriteLodCenter.w * scale);
+    // The same position hash as InstanceRenderer.Population.InitializeSlot keeps density thinning stable.
+    uint key = asuint(transform.translation.x) * 73856093u ^ asuint(transform.translation.y) * 19349663u ^
+        asuint(transform.translation.z) * 83492791u;
+    bounds.state = float4(1, determinant < 0 ? 1 : 0, range.w, StableFraction(key));
+    _WriteBounds[slot] = bounds;
+    Affine inverse = Invert(transform, determinant);
+    for (uint data = 0; data < (uint)_WriteDataParts; data++)
+    {
+        StoreMatrix(data, slot, Multiply(transform, LoadPart(data * 6)));
+        StoreMatrix(_WriteDataParts + data, slot, Multiply(LoadPart(data * 6 + 3), inverse));
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ClearRanges(uint3 id : SV_DispatchThreadID)
+{
+    if (id.y >= (uint)_WriteRangeCount) return;
+    uint4 range = _ClearRanges[id.y];
+    if (id.x >= range.y) return;
+    uint slot = range.x + id.x;
+    if (slot < (uint)_WriteCapacity) _WriteBounds[slot] = (InstanceBounds)0;
+}
+
+// New storage starts inactive, with identity spatial order. Each range is spatially coherent.
+[numthreads(64, 1, 1)]
+void InitializeStorage(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= (uint)_WriteCapacity) return;
+    _WriteSpatialOrder[slot] = slot;
+    _WriteBounds[slot] = (InstanceBounds)0;
+}
+
+// Copy written ranges from the previous storage. Group y selects the range.
+// Capacity changes keep each slot. Compaction moves ranges down to close free gaps.
+[numthreads(64, 1, 1)]
+void MoveRanges(uint3 id : SV_DispatchThreadID)
+{
+    if (id.y >= (uint)_WriteRangeCount) return;
+    uint4 move = _MoveRanges[id.y];
+    if (id.x >= move.z) return;
+    uint source = move.x + id.x;
+    uint destination = move.y + id.x;
+    _WriteBounds[destination] = _RelayoutBounds[source];
+    for (uint array = 0; array < (uint)_RelayoutArrays; array++)
+    {
+        uint from = (16 + (array * (uint)_RelayoutCapacity + source) * 12) * 4;
+        uint to = (16 + (array * (uint)_WriteCapacity + destination) * 12) * 4;
+        _WriteData.Store4(to, _RelayoutData.Load4(from));
+        _WriteData.Store4(to + 16, _RelayoutData.Load4(from + 16));
+        _WriteData.Store4(to + 32, _RelayoutData.Load4(from + 32));
+    }
+}

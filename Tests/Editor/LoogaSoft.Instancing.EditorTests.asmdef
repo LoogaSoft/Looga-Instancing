@@ -3,6 +3,7 @@
   "references": [
     "LoogaSoft.Instancing",
     "LoogaSoft.Instancing.Editor",
+    "Unity.RenderPipelines.Core.Runtime",
     "Unity.RenderPipelines.Universal.Runtime"
   ],
   "includePlatforms": [

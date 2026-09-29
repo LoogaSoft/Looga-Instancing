@@ -18,6 +18,8 @@ Transparent sorting and SkinnedMeshRenderer submission are not supported by this
 
 - `InstanceRenderer`: BRG registration, GPU frustum and distance culling, LOD, buffer residency and changed-instance uploads.
 - `InstanceContainer`: serialized placements, stable IDs, edits, streamed prototype leases and render ownership.
+- `InstanceSet`: static placements of several prototypes in one renderer. Entries have an owner and a prototype.
+  Placements have no IDs, so a change replaces a whole entry. Use it when many prototypes need no per-placement edits.
 - `SceneInstanceProvider`: reversible submission of existing scene mesh hierarchies. Gameplay components stay on their original objects.
 - `MeshScatterAuthoring`: deterministic mesh scattering, painting, source masks and localized regeneration.
 - `InstanceColliderResidency`: nearby collision proxies independent of visual visibility.
@@ -28,6 +30,8 @@ Transparent sorting and SkinnedMeshRenderer submission are not supported by this
 - `InstanceWorldCells`: content-specific occupancy, residency, dirty revisions, and diagnostics for later visibility and streaming passes.
 - Optional SpeedTree assembly: native wind integration with supported Unity versions.
 - Optional Splines assembly: public Unity spline geometry, exclusion corridors, edits, Undo and source replacement.
+
+- `ShaderLibrary`: the shader side of the vegetation contracts, for any package or project shader. See Vegetation shader library.
 
 TerrainData tree/detail generation, terrain ground bindings, terrain RVT and terrain-tool adapters remain in Looga Terrain.
 Graphics Pro retains lighting, general RVT, SVT and its shader-specific instance material profiles.
@@ -65,6 +69,18 @@ Standalone prototype export preserves native mesh, LOD and collider references. 
 Scene and TerrainData adapters acquire visibility only after a complete prototype and placement build. An unsupported material, prototype, external owner, or incomplete tool update leaves native rendering active. Disabling the adapter releases only the visibility it acquired. It does not disable colliders, scripts, source GameObjects, shared materials, TerrainData, or authoring tools.
 
 Runtime systems can implement `IRuntimeInstanceSource` and bind it through `RuntimeInstanceSourceAdapter`. A capture is atomic. A failed or incomplete revision keeps the last complete Looga population until the producer signals another change. The target `InstanceContainer` must be dedicated to that adapter; disabling the adapter clears the derived target while leaving the producer's data untouched.
+
+## Vegetation shader library
+
+Vegetation shaders include `Packages/com.loogasoft.loogainstancing/ShaderLibrary/VegetationDeformation.hlsl` after the URP
+surface input. It supplies `VegetationBend`, `VegetationBendAtTime`, `VegetationNormal` and `VegetationTangent`: wind,
+the `VegetationWindField` volumes, `VegetationInteractor` pushes and ground conformance.
+The shader declares the material properties that the file lists. Tag the shader `LoogaInstanceDeformation` = `Vegetation`
+so that the prototype bounds include the displacement.
+Call `VegetationGustSheen(positionWS, sheen, surface)` in the fragment surface setup for the light bands of passing gusts.
+`VegetationLighting.hlsl` applies the instance lightmap color. `VegetationGroundData.hlsl` and
+`VegetationGroundCache.hlsl` read the ground globals. Looga Terrain writes them; without it, the ground functions
+have no effect.
 
 ## Material bindings
 
