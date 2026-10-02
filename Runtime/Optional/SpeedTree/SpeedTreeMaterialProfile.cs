@@ -14,12 +14,15 @@ namespace LoogaSoft.Instancing.SpeedTree
     public sealed class SpeedTreeMaterialProfile : InstanceMaterialProfile
     {
         [SerializeField, Min(0)] private float _boundsPadding = 10;
+        [Tooltip("Copies of the SpeedTree 8 or 9 graph that keep its wind, LOD and vertex inputs.")]
+        [SerializeField] private Shader[] _compatibleShaders = Array.Empty<Shader>();
         public override float BoundsPadding => _boundsPadding;
         public override bool SpeedTreeLod => true;
         public override bool Supports(Material material)
         {
             return material && (material.shader.name == "Universal Render Pipeline/Nature/SpeedTree8_PBRLit" ||
-                material.shader.name == "Universal Render Pipeline/Nature/SpeedTree9_URP");
+                material.shader.name == "Universal Render Pipeline/Nature/SpeedTree9_URP" ||
+                Array.IndexOf(_compatibleShaders, material.shader) >= 0);
         }
         private readonly Dictionary<GameObject, WindSource> _sources = new();
 
