@@ -199,6 +199,8 @@ namespace LoogaSoft.Instancing
         private readonly List<InstancePrototypeRegistration> _prototypeRegistrations = new();
         private readonly Vector4[] _planes = new Vector4[64];
         private readonly Vector4[] _splits = new Vector4[16];
+        private readonly Vector4[] _splitRules = new Vector4[16];
+        private readonly Vector4[] _hierarchyPlanes = new Vector4[64];
         private readonly Matrix4x4[] _bakedOccluders = new Matrix4x4[BakedInstanceOcclusion.MaximumBoxes];
         private readonly int _reset;
         private readonly int _resetAll;
@@ -263,6 +265,39 @@ namespace LoogaSoft.Instancing
 
         /// <summary>Minimum LOD index for shadows. Zero keeps camera LOD selection.</summary>
         public int MinimumShadowLod { get; set; }
+
+        /// <summary>
+        /// Minimum bound diameter in shadow texels of each directional split whose texel size the shadow renderer
+        /// publishes through <see cref="InstanceShadowSplits"/>. Smaller casters are skipped in that split only.
+        /// Prototype quality can override it. Zero disables the rule.
+        /// </summary>
+        public float MinimumShadowTexels { get; set; } = 2;
+
+        /// <summary>
+        /// Floor shadow LOD in each published directional split at the LOD the camera selects for the same
+        /// coverage in pixels as the caster has in that split's texels.
+        /// </summary>
+        public bool ShadowTexelLod { get; set; } = true;
+
+        private bool _staticShadowCaster;
+        private long _staticCasterSignature;
+
+        /// <summary>
+        /// Mark the instances as static shadow casters, like <see cref="Renderer.staticShadowCaster"/>. Shadow
+        /// renderers may cache them instead of drawing them every frame, and redraw them when
+        /// <see cref="InstanceShadowSplits.StaticCasterRevision"/> changes. Defaults to true for static transforms.
+        /// Shader motion such as wind then stays as it was drawn in cached shadows.
+        /// </summary>
+        public bool StaticShadowCaster
+        {
+            get => _staticShadowCaster;
+            set
+            {
+                if (_staticShadowCaster == value) return;
+                _staticShadowCaster = value;
+                InstanceShadowSplits.NotifyStaticCastersChanged();
+            }
+        }
 
         /// <summary>Current live source instance count, before camera and shadow culling.</summary>
         public int InstanceCount { get; private set; }
@@ -352,6 +387,7 @@ namespace LoogaSoft.Instancing
         {
             _gpuResident = gpuResident;
             _staticTransforms = staticTransforms || gpuResident;
+            _staticShadowCaster = _staticTransforms;
             if (SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D12 || !SystemInfo.supportsComputeShaders)
             {
                 throw new NotSupportedException("The first instance renderer target is Windows Direct3D 12.");
@@ -804,6 +840,7 @@ namespace LoogaSoft.Instancing
         {
             if (_disposed) return;
             _disposed = true;
+            if (_staticShadowCaster && InstanceCount > 0) InstanceShadowSplits.NotifyStaticCastersChanged();
             InstanceCullScheduler.CancelOwner(this);
             InstanceOcclusion.Remove(this);
             RenderPipelineManager.endContextRendering -= EndContext;
@@ -892,7 +929,7 @@ namespace LoogaSoft.Instancing
                 {
                     continue;
                 }
-                var data = new uint[view.Arguments.count];
+                var data = new uint[view.UsedArgumentCount(population)];
                 view.Arguments.GetData(data);
                 for (int i = 1; i < data.Length; i += 5)
                 {
@@ -911,7 +948,7 @@ namespace LoogaSoft.Instancing
                 foreach (var view in population.Views)
                 {
                     if (view.Camera != camera || view.Frame != Time.frameCount) continue;
-                    var arguments = new uint[view.Arguments.count];
+                    var arguments = new uint[view.UsedArgumentCount(population)];
                     view.Arguments.GetData(arguments);
                     for (int i = 1; i < arguments.Length; i += 5)
                     {
@@ -1049,9 +1086,12 @@ namespace LoogaSoft.Instancing
                 _cameraViews.Peek() : null;
             // Advance camera diagnostics before an empty cull can return.
             long evaluationSequence = RecordCameraEvaluation(camera);
+            TrackStaticCasterChanges();
             if (!RenderingEnabled) return default;
             if (_disposed || InstanceCount == 0 || (context.cullingLayerMask & (1u << _layer)) == 0 ||
                 (context.viewType != BatchCullingViewType.Camera && context.viewType != BatchCullingViewType.Light)) return default;
+            if (context.viewType == BatchCullingViewType.Light &&
+                InstanceShadowSplits.IsIgnored(context.viewID.GetInstanceID())) return default;
             int commandCount = 0;
             int rangeCount = 0;
             foreach (Population population in _populations)
@@ -1063,10 +1103,6 @@ namespace LoogaSoft.Instancing
                 }
             }
             if (commandCount == 0) return default;
-            var result = (BatchCullingOutputDrawCommands*)output.drawCommands.GetUnsafePtr();
-            *result = default;
-            result->indirectDrawCommands = Allocate<BatchDrawCommandIndirect>(commandCount);
-            result->drawRanges = Allocate<BatchDrawRange>(rangeCount);
             int planeCount = context.cullingPlanes.Length;
             int splitCount = context.cullingSplits.Length;
             // Fail visible when a view exceeds the fixed plane budget.
@@ -1075,6 +1111,15 @@ namespace LoogaSoft.Instancing
                 planeCount = 0;
                 splitCount = 0;
             }
+            // A shadow view with several splits draws each split from its own visible list. One shared list
+            // would draw every split's casters into every split.
+            bool splitOutput = context.viewType == BatchCullingViewType.Light && splitCount > 1;
+            if (splitOutput) commandCount *= splitCount;
+            float[] splitTexels = null;
+            int dynamicOnlySplits = 0;
+            bool texelRules = splitOutput && context.projectionType == BatchCullingProjectionType.Orthographic &&
+                InstanceShadowSplits.TryGetTexelSizes(context.viewID.GetInstanceID(), splitCount, out splitTexels,
+                    out dynamicOnlySplits);
             for (int i = 0; i < planeCount; i++)
             {
                 Plane plane = context.cullingPlanes[i];
@@ -1085,6 +1130,38 @@ namespace LoogaSoft.Instancing
                 _splits[i] = new Vector4(context.cullingSplits[i].cullingPlaneOffset, context.cullingSplits[i].cullingPlaneCount, 0, 0);
             }
             var lod = context.lodParameters;
+            bool shadow = context.viewType == BatchCullingViewType.Light;
+            bool hasOcclusion = InstanceVisibility.TryGet(camera, out InstanceVisibilityContext visibility);
+            InstanceVisibilityMode adaptiveMode = VisibilityMode;
+            if (_worldHierarchy != null)
+            {
+                float hierarchyDistance = 0;
+                float hierarchyReach = 0;
+                foreach (Population population in _populations)
+                {
+                    if (shadow && population.Quality.ShadowMode == InstanceShadowMode.Off) continue;
+                    float range = shadow ? GetShadowDistance(population) : GetViewDistance(population);
+                    hierarchyDistance = Mathf.Max(hierarchyDistance, range);
+                    hierarchyReach = Mathf.Max(hierarchyReach, population.HierarchyReach);
+                }
+                LastHierarchyDecision = EvaluateHierarchy(planeCount, splitCount, lod.cameraPosition,
+                    hierarchyDistance, hasOcclusion, hierarchyReach);
+                // Reject the view before the allocations and the command buffer.
+                // Each renderer gets one callback for each camera and shadow view, also when it is out of range.
+                if (!LastHierarchyDecision.Visible)
+                {
+                    _viewCursor++;
+                    return default;
+                }
+                if (AdaptiveHierarchy)
+                {
+                    adaptiveMode = LastHierarchyDecision.VisibilityMode;
+                }
+            }
+            var result = (BatchCullingOutputDrawCommands*)output.drawCommands.GetUnsafePtr();
+            *result = default;
+            result->indirectDrawCommands = Allocate<BatchDrawCommandIndirect>(commandCount);
+            result->drawRanges = Allocate<BatchDrawRange>(rangeCount);
             float scale = QualitySettings.lodBias / (2 * (lod.isOrthographic ? Mathf.Max(lod.orthoSize, 0.001f) :
                 Mathf.Tan(lod.fieldOfView * Mathf.Deg2Rad * 0.5f)));
             var cmd = CommandBufferPool.Get("Looga Instances.Cull");
@@ -1096,36 +1173,9 @@ namespace LoogaSoft.Instancing
                 cmd.SetComputeVectorArrayParam(_shader, "_Planes", _planes);
                 cmd.SetComputeVectorArrayParam(_shader, "_Splits", _splits);
                 cmd.SetComputeVectorParam(_shader, "_Camera", lod.cameraPosition);
-                bool shadow = context.viewType == BatchCullingViewType.Light;
                 string selectSample = shadow ? "Looga.Select Light" : "Looga.Select Camera";
                 string lodSample = shadow ? "Looga.LOD Light" : "Looga.LOD Camera";
                 string appendSample = shadow ? "Looga.Append Light" : "Looga.Append Camera";
-                bool hasOcclusion = InstanceVisibility.TryGet(camera,
-                    out InstanceVisibilityContext visibility);
-                InstanceVisibilityMode adaptiveMode = VisibilityMode;
-                if (_worldHierarchy != null)
-                {
-                    float hierarchyDistance = 0;
-                    float hierarchyReach = 0;
-                    foreach (Population population in _populations)
-                    {
-                        if (shadow && population.Quality.ShadowMode == InstanceShadowMode.Off) continue;
-                        float range = shadow ? GetShadowDistance(population) : GetViewDistance(population);
-                        hierarchyDistance = Mathf.Max(hierarchyDistance, range);
-                        hierarchyReach = Mathf.Max(hierarchyReach, population.HierarchyReach);
-                    }
-                    LastHierarchyDecision = _worldHierarchy.Evaluate(_planes, planeCount, lod.cameraPosition,
-                        hierarchyDistance, hasOcclusion, VisibilityMode, hierarchyReach);
-                    if (!LastHierarchyDecision.Visible)
-                    {
-                        _viewCursor++;
-                        return default;
-                    }
-                    if (AdaptiveHierarchy)
-                    {
-                        adaptiveMode = LastHierarchyDecision.VisibilityMode;
-                    }
-                }
                 int boxes = !shadow && !lod.isOrthographic ? BakedInstanceOcclusion.CopyActiveBoxes(_bakedOccluders, context.cullingLayerMask) : 0;
                 cmd.SetComputeIntParam(_shader, "_BakedOccluderCount", boxes);
                 if (boxes > 0)
@@ -1151,6 +1201,15 @@ namespace LoogaSoft.Instancing
                     bool limitSplits = shadow && context.projectionType == BatchCullingProjectionType.Orthographic && quality.ShadowSplits > 0;
                     int admittedSplits = limitSplits ? Mathf.Min(splitCount, quality.ShadowSplits) : splitCount;
                     cmd.SetComputeIntParam(_shader, "_SplitCount", admittedSplits);
+                    int outputSplits = splitOutput ? admittedSplits : 0;
+                    cmd.SetComputeIntParam(_shader, "_OutputSplits", outputSplits);
+                    cmd.SetComputeIntParam(_shader, "_SplitBucketStride", population.Prototype.PartCount * population.BucketsPerPart);
+                    if (outputSplits > 0)
+                    {
+                        SetSplitRules(quality, lod, lodBias, texelRules ? splitTexels : null,
+                            _staticShadowCaster ? dynamicOnlySplits : 0, outputSplits);
+                        cmd.SetComputeVectorArrayParam(_shader, "_SplitRules", _splitRules);
+                    }
                     cmd.SetComputeVectorParam(_shader, "_Quality", new Vector4(quality.Density, shadow ? 0 : quality.MinimumPixels,
                         shadow ? quality.ShadowFadeDistance : 0, Mathf.Max(1, lod.cameraPixelHeight) / lodBias));
                     bool viewFade = !shadow && quality.ViewFadeDistance > 0 && distance < float.MaxValue;
@@ -1163,6 +1222,7 @@ namespace LoogaSoft.Instancing
                         falloff ? quality.DensityFalloffDistance : 0, quality.FarDensity));
 
                     ViewBuffers view = population.GetView(_viewCursor);
+                    view.UseSplits(population, Mathf.Max(1, outputSplits));
                     cmd.SetComputeIntParam(_shader, "_Count", population.HighWater);
                     cmd.SetComputeIntParam(_shader, "_Capacity", population.Capacity);
                     cmd.SetComputeIntParam(_shader, "_BucketStride", population.BucketsPerPart);
@@ -1288,7 +1348,7 @@ namespace LoogaSoft.Instancing
                         cmd.SetComputeBufferParam(_shader, cullPartsKernel, "_PartParameters", population.PartParameters);
                         cmd.BeginSample(appendSample);
                         cmd.DispatchCompute(_shader, _resetAll,
-                            (population.Prototype.PartCount * population.BucketsPerPart + 63) / 64, 1, 1);
+                            (population.Prototype.PartCount * population.BucketsPerPart * view.OutputSplits + 63) / 64, 1, 1);
                         cmd.DispatchCompute(_shader, cullPartsKernel, (population.HighWater + 63) / 64,
                             population.Prototype.PartCount, 1);
                         cmd.EndSample(appendSample);
@@ -1329,9 +1389,12 @@ namespace LoogaSoft.Instancing
                             cmd.EndSample(appendSample);
                         }
                         int begin = result->indirectDrawCommandCount;
+                        int splitBuckets = population.Prototype.PartCount * population.BucketsPerPart;
+                        ushort viewSplitMask = limitSplits ? (ushort)((1u << quality.ShadowSplits) - 1) : ushort.MaxValue;
+                        for (int split = 0; split < view.OutputSplits; split++)
                         for (int entry = 0; entry < population.BucketsPerPart; entry++)
                         {
-                            int bucket = partIndex * population.BucketsPerPart + entry;
+                            int bucket = split * splitBuckets + partIndex * population.BucketsPerPart + entry;
                             bool packedFade = entry >= 2;
                             result->indirectDrawCommands[result->indirectDrawCommandCount++] = new BatchDrawCommandIndirect
                             {
@@ -1345,7 +1408,7 @@ namespace LoogaSoft.Instancing
                                     (packedFade ? (part.Lod < population.Prototype.PercentageLods ?
                                         BatchDrawCommandFlags.LODCrossFadeValuePacked : BatchDrawCommandFlags.LODCrossFade) :
                                         BatchDrawCommandFlags.None),
-                                splitVisibilityMask = limitSplits ? (ushort)((1u << quality.ShadowSplits) - 1) : ushort.MaxValue,
+                                splitVisibilityMask = outputSplits > 0 ? (ushort)(1u << split) : viewSplitMask,
                                 lightmapIndex = part.LightmapIndex,
                                 topology = MeshTopology.Triangles,
                                 visibleOffset = (uint)(bucket * population.Capacity),
@@ -1359,7 +1422,7 @@ namespace LoogaSoft.Instancing
                         {
                             drawCommandsType = BatchDrawCommandType.Indirect,
                             drawCommandsBegin = (uint)begin,
-                            drawCommandsCount = (uint)population.BucketsPerPart,
+                            drawCommandsCount = (uint)(population.BucketsPerPart * view.OutputSplits),
                             filterSettings = new BatchFilterSettings
                             {
                                 layer = (byte)_layer,
@@ -1373,6 +1436,7 @@ namespace LoogaSoft.Instancing
                                     _ => part.Shadows
                                 },
                                 receiveShadows = part.ReceiveShadows,
+                                staticShadowCaster = _staticShadowCaster,
                                 motionMode = part.HasMotion ? MotionVectorGenerationMode.Object : MotionVectorGenerationMode.Camera
                             }
                         };
@@ -1395,6 +1459,45 @@ namespace LoogaSoft.Instancing
             return default;
         }
 
+        // A view with several splits covers the union of its splits, so a region visible in any split is visible.
+        // All planes together would bound only the splits' intersection, which is empty for disjoint splits.
+        // The decision of the split with the most candidates chooses the visibility work.
+        private InstanceHierarchyDecision EvaluateHierarchy(int planeCount, int splitCount, Vector3 camera,
+            float distance, bool occlusion, float reach)
+        {
+            if (splitCount <= 1)
+            {
+                return _worldHierarchy.Evaluate(_planes, planeCount, camera, distance, occlusion, VisibilityMode, reach);
+            }
+            InstanceHierarchyDecision chosen = default;
+            for (int split = 0; split < splitCount; split++)
+            {
+                int offset = (int)_splits[split].x;
+                int count = (int)_splits[split].y;
+                Array.Copy(_planes, offset, _hierarchyPlanes, 0, count);
+                InstanceHierarchyDecision decision = _worldHierarchy.Evaluate(_hierarchyPlanes, count, camera, distance,
+                    occlusion, VisibilityMode, reach);
+                if (split == 0 || decision.CandidateInstances > chosen.CandidateInstances) chosen = decision;
+            }
+            return chosen;
+        }
+
+        // Every view sees the content its culls draw, so any change since the last view, including uploads that
+        // finish over several frames, reaches cached shadows within a frame.
+        private void TrackStaticCasterChanges()
+        {
+            if (!_staticShadowCaster) return;
+            long signature = RenderingEnabled ? 1 : 2;
+            foreach (Population population in _populations)
+            {
+                bool pending = population.Dirty.Count > 0 || population.GpuCommitPending;
+                signature = unchecked(signature * 31 + population.SourceRevision * 2 + (pending ? 1 : 0));
+            }
+            if (signature == _staticCasterSignature) return;
+            _staticCasterSignature = signature;
+            InstanceShadowSplits.NotifyStaticCastersChanged();
+        }
+
         private static unsafe T* Allocate<T>(int count) where T : unmanaged
         {
             return (T*)UnsafeUtility.Malloc(count * UnsafeUtility.SizeOf<T>(), UnsafeUtility.AlignOf<T>(), Allocator.TempJob);
@@ -1402,9 +1505,12 @@ namespace LoogaSoft.Instancing
 
         private sealed class ViewBuffers : IDisposable
         {
-            internal readonly GraphicsBuffer Visible;
-            internal readonly GraphicsBuffer Arguments;
+            internal GraphicsBuffer Visible;
+            internal GraphicsBuffer Arguments;
             internal readonly GraphicsBuffer OcclusionStatistics;
+            // Visible lists the buffers hold, one per shadow split, and the number the latest cull wrote.
+            internal int AllocatedSplits;
+            internal int OutputSplits = 1;
             internal GraphicsBuffer Selection;
             internal Camera Camera;
             internal int Frame;
@@ -1428,20 +1534,46 @@ namespace LoogaSoft.Instancing
             internal ViewBuffers(Population population)
             {
                 MeshHistories = new GraphicsBuffer[population.Prototype.PartCount];
-                int count = population.Prototype.PartCount * population.BucketsPerPart;
+                OcclusionStatistics = new GraphicsBuffer(GraphicsBuffer.Target.Raw, 2, 4);
+                AllocateLists(population, 1);
+            }
+
+            // Pooled views serve camera and shadow views alike, so the lists only grow.
+            internal void UseSplits(Population population, int splits)
+            {
+                if (splits > AllocatedSplits)
+                {
+                    Visible.Dispose();
+                    Arguments.Dispose();
+                    AllocateLists(population, splits);
+                }
+                OutputSplits = splits;
+            }
+
+            // Bucket counts the latest cull wrote. Larger pooled views keep stale counts after them.
+            internal int UsedArgumentCount(Population population)
+            {
+                return OutputSplits * population.Prototype.PartCount * population.BucketsPerPart * 5;
+            }
+
+            private void AllocateLists(Population population, int splits)
+            {
+                int perSplit = population.Prototype.PartCount * population.BucketsPerPart;
+                int count = perSplit * splits;
                 Visible = new GraphicsBuffer(GraphicsBuffer.Target.Raw, count * population.Capacity, 4);
                 Arguments = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.IndirectArguments, count * 5, 4);
-                OcclusionStatistics = new GraphicsBuffer(GraphicsBuffer.Target.Raw, 2, 4);
                 var arguments = new uint[count * 5];
                 for (int i = 0; i < count; i++)
                 {
-                    var part = population.Prototype.Parts[i / population.BucketsPerPart];
+                    var part = population.Prototype.Parts[i % perSplit / population.BucketsPerPart];
                     arguments[i * 5] = part.IndexCount;
                     arguments[i * 5 + 2] = part.IndexStart;
                     arguments[i * 5 + 3] = part.Mesh.GetBaseVertex(part.Submesh);
                 }
                 Arguments.SetData(arguments);
+                AllocatedSplits = splits;
             }
+
             public void Dispose()
             {
                 Visible.Dispose();
@@ -1463,6 +1595,30 @@ namespace LoogaSoft.Instancing
         {
             if (population.Quality.ViewDistance > 0) return population.Quality.ViewDistance;
             return population.Prototype.NativeLodDistance ? float.MaxValue : MaxDistance;
+        }
+
+        // Per-split rules from published shadow texel sizes, or none. The LOD ratio mirrors the camera ratio, which is
+        // the LOD size over the view height, scaled by both LOD biases: here the view height becomes one texel per pixel.
+        // The mesh metric mirrors _MeshMetric times distance, the world size of one pixel, with one texel instead.
+        // Skipped splits are drawn from the shadow renderer's cache of static casters.
+        private void SetSplitRules(InstanceQualitySettings quality, LODParameters lod, float lodBias, float[] texelSizes,
+            int skippedSplits, int splits)
+        {
+            float minimumTexels = quality.MinimumShadowTexels > 0 ? quality.MinimumShadowTexels : MinimumShadowTexels;
+            for (int split = 0; split < splits; split++)
+            {
+                if (texelSizes == null)
+                {
+                    _splitRules[split] = Vector4.zero;
+                    continue;
+                }
+                float texel = texelSizes[split];
+                _splitRules[split] = new Vector4(
+                    minimumTexels * texel,
+                    ShadowTexelLod ? QualitySettings.lodBias * lodBias / (texel * Mathf.Max(1, lod.cameraPixelHeight)) : 0,
+                    ShadowTexelLod ? QualitySettings.meshLodThreshold * texel / lodBias : 0,
+                    (skippedSplits >> split & 1) != 0 ? 1 : 0);
+            }
         }
 
         private float GetShadowDistance(Population population)
@@ -1654,10 +1810,10 @@ namespace LoogaSoft.Instancing
                 get
                 {
                     if (Buffer == null) return 0;
-                    long bytes = (long)Buffer.count * 4 + (long)BoundsBuffer.count * 48 +
-                        (long)Views.Count * Prototype.PartCount * BucketsPerPart * (Capacity * 4L + 20) + (long)_histories.Count * Capacity * 16;
+                    long bytes = (long)Buffer.count * 4 + (long)BoundsBuffer.count * 48 + (long)_histories.Count * Capacity * 16;
                     foreach (var view in Views)
                     {
+                        bytes += (long)view.AllocatedSplits * Prototype.PartCount * BucketsPerPart * (Capacity * 4L + 20);
                         bytes += view.Selection == null ? 0 : view.Selection.count * 16L;
                     }
                     return bytes + PartParameters.count * 64L +

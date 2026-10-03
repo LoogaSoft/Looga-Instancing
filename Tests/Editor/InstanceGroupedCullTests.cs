@@ -76,6 +76,7 @@ namespace LoogaSoft.Instancing.Tests
             shader.SetInt("_Count", Count);
             shader.SetInt("_Capacity", Capacity);
             shader.SetInt("_BucketStride", Buckets);
+            shader.SetInt("_OutputSplits", 0);
             shader.SetInt("_Part", 0);
             shader.SetInt("_PartCount", 1);
             shader.SetInt("_PartLod", 0);

@@ -57,6 +57,13 @@ int _PlaneCount;
 int _SplitCount;
 float4 _Planes[64];
 float4 _Splits[16];
+// Shadow views with several splits keep one visible list per split, so each split draws only its own casters.
+// Zero keeps a single list for the whole view.
+int _OutputSplits;
+int _SplitBucketStride; // Buckets of one split: part count times bucket stride.
+// Per split: x minimum bound diameter, y LOD ratio per unit of LOD size, z mesh LOD metric, w skip the split.
+// Zero disables a rule.
+float4 _SplitRules[16];
 float4 _Camera;
 float4 _Lod; // Scale, orthographic, max distance, minimum shadow LOD.
 float4 _Thresholds[2];
@@ -86,8 +93,16 @@ struct PartCullData
 };
 StructuredBuffer<PartCullData> _PartParameters;
 
+// Mesh LOD level for a world size per pixel or texel, relative to the instance's mesh bounds.
+int MeshLevelForMetric(float metric, float diameter, int meshLevels, float4 meshSelection)
+{
+    float level = max(0, log2(max(metric / diameter, 0.000001)) * meshSelection.x + meshSelection.y);
+    return (int)clamp(floor(level + meshSelection.z), 0, meshLevels - 1);
+}
+
+// splitMetric is a split's mesh LOD metric, or zero to select for the camera only.
 int SelectMeshLevel(uint index, uint dataPart, int meshLevels, float4 meshSelection,
-    float3 meshCenter, float3 meshExtents)
+    float3 meshCenter, float3 meshExtents, float splitMetric = 0)
 {
     if (meshSelection.w >= 0) return clamp((int)meshSelection.w, 0, meshLevels - 1);
     uint address = 64 + (dataPart * _Capacity + index) * 48;
@@ -98,9 +113,9 @@ int SelectMeshLevel(uint index, uint dataPart, int meshLevels, float4 meshSelect
     float3 center = t + x * meshCenter.x + y * meshCenter.y + z * meshCenter.z;
     float3 extents = abs(x) * meshExtents.x + abs(y) * meshExtents.y + abs(z) * meshExtents.z;
     float diameter = 2 * sqrt(max(dot(extents, extents), 0.00001));
+    if (splitMetric > 0) return MeshLevelForMetric(splitMetric, diameter, meshLevels, meshSelection);
     float metric = _MeshMetric * (_Lod.y > 0 ? 1 : distance(center, _Camera.xyz));
-    float level = max(0, log2(max(metric / diameter, 0.000001)) * meshSelection.x + meshSelection.y);
-    return (int)clamp(floor(level + meshSelection.z), 0, meshLevels - 1);
+    return MeshLevelForMetric(metric, diameter, meshLevels, meshSelection);
 }
 float4 _TransitionTime;
 RWStructuredBuffer<float4> _LodHistory;
@@ -163,13 +178,21 @@ void UpdateMeshLod(uint3 id : SV_DispatchThreadID)
         _MeshCenter.xyz, _MeshExtents.xyz), _Bounds[index].state.z);
 }
 
+uint OutputSplitCount()
+{
+    return (uint)max(1, _OutputSplits);
+}
+
 [numthreads(1, 1, 1)]
 void Reset(uint3 id : SV_DispatchThreadID)
 {
     uint stride = max(2, _BucketStride);
-    for (uint entry = 0; entry < stride; entry++)
+    for (uint split = 0; split < OutputSplitCount(); split++)
     {
-        _Arguments.Store((_Part * stride + entry) * 20 + 4, 0);
+        for (uint entry = 0; entry < stride; entry++)
+        {
+            _Arguments.Store((split * _SplitBucketStride + _Part * stride + entry) * 20 + 4, 0);
+        }
     }
 }
 
@@ -259,7 +282,7 @@ float4 SelectInstance(InstanceBounds item)
 void ResetAll(uint3 id : SV_DispatchThreadID)
 {
     uint entry = id.x;
-    uint count = (uint)(_PartCount * max(2, _BucketStride));
+    uint count = (uint)(_PartCount * max(2, _BucketStride)) * OutputSplitCount();
     if (entry < count) _Arguments.Store(entry * 20 + 4, 0);
 }
 
@@ -394,15 +417,23 @@ void SelectVisibilityOcclusion(uint3 id : SV_DispatchThreadID, uint lane : SV_Gr
     SelectVisibilityCommon(id, lane, true);
 }
 
+// split is the visible list of a split shadow view, or -1 for a view with one list.
 bool CullPart(uint index, uint part, uint dataPart, int partLod, int partFlip, int meshLevel, int meshLevels,
     float4 meshSelection, float3 meshCenter, float3 meshExtents, bool meshFadeEnabled,
-    bool materialViewFade, out uint bucket, out uint packed)
+    bool materialViewFade, int split, out uint bucket, out uint packed)
 {
     bucket = 0;
     packed = 0;
     InstanceBounds item = _Bounds[index];
     float4 selection = _SelectionMode > 0 ? _Selection[index] : SelectInstance(item);
     if (selection.x == 0) return false;
+    float4 splitRule = 0;
+    if (split >= 0)
+    {
+        splitRule = _SplitRules[split];
+        if (splitRule.w > 0 || 2 * item.sphere.w < splitRule.x) return false;
+        if (!InSplit(item.sphere, (int)_Splits[split].x, (int)_Splits[split].y)) return false;
+    }
     if (_ViewFade.y > 0 && !materialViewFade &&
         item.state.w / max(_Quality.x, 0.000001) >=
         saturate((_ViewFade.x - max(0, selection.y - item.sphere.w)) / _ViewFade.y)) return false;
@@ -418,6 +449,8 @@ bool CullPart(uint index, uint part, uint dataPart, int partLod, int partFlip, i
     }
     if (selected == _LodCount && _AnimatedFade == 0) return false;
     int minimumLod = min((int)_Lod.w, _LodCount - 1);
+    // In a split, the camera's LOD choice for the same coverage in pixels as the caster has in texels.
+    if (splitRule.y > 0) minimumLod = max(minimumLod, min(SelectLevel(item.lod.w * splitRule.y), _LodCount - 1));
     float fade = 1;
     int target = selected + 1;
     float width = selected < _LodCount ? _FadeWidths[(uint)selected >> 2][(uint)selected & 3] : 0;
@@ -460,15 +493,18 @@ bool CullPart(uint index, uint part, uint dataPart, int partLod, int partFlip, i
     if (meshLevels > 1)
     {
         int selectedMesh = SelectMeshLevel(index, dataPart, meshLevels, meshSelection, meshCenter, meshExtents);
-        if (meshFadeEnabled && signedFade == 1 && !percentage)
+        int splitMesh = splitRule.z > 0 ?
+            SelectMeshLevel(index, dataPart, meshLevels, meshSelection, meshCenter, meshExtents, splitRule.z) : 0;
+        float4 transition = meshFadeEnabled ? _MeshHistory[index] : 0;
+        // The camera's mesh transition applies while both of its levels are at least the split's level.
+        if (meshFadeEnabled && signedFade == 1 && !percentage && splitMesh <= (int)min(transition.x, transition.y))
         {
-            float4 transition = _MeshHistory[index];
             float meshFade = transition.x == transition.y ? 1 : 1 - saturate((_TransitionTime.x - transition.z) / _TransitionTime.y);
             if (meshLevel == (int)transition.x && meshFade > 0) signedFade = meshFade;
             else if (meshLevel == (int)transition.y && meshFade < 1) signedFade = -max(meshFade, 1.0 / 127);
             else return false;
         }
-        else if (selectedMesh != meshLevel) return false;
+        else if (max(selectedMesh, splitMesh) != meshLevel) return false;
     }
     bool packedFade = percentage || signedFade < 1;
     uint stride = max(2, _BucketStride);
@@ -491,15 +527,25 @@ void AppendVisible(uint bucket, uint packed)
     _Visible.Store((bucket * _Capacity + offset) * 4, packed);
 }
 
+// The split argument of CullPart for output list `split`.
+int CullSplit(uint split)
+{
+    return _OutputSplits > 0 ? (int)split : -1;
+}
+
 [numthreads(64, 1, 1)]
 void Cull(uint3 id : SV_DispatchThreadID)
 {
     uint index = id.x;
     if (index >= (uint)_Count) return;
-    uint bucket, packed;
-    if (CullPart(index, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
-        _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
-        _PartMaterialFade != 0, bucket, packed)) AppendVisible(bucket, packed);
+    for (uint split = 0; split < OutputSplitCount(); split++)
+    {
+        uint bucket, packed;
+        if (CullPart(index, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
+            _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
+            _PartMaterialFade != 0, CullSplit(split), bucket, packed))
+            AppendVisible(bucket + split * _SplitBucketStride, packed);
+    }
 }
 
 [numthreads(64, 1, 1)]
@@ -509,16 +555,21 @@ void CullParts(uint3 id : SV_DispatchThreadID)
     uint part = id.y;
     if (index >= (uint)_Count || part >= (uint)_PartCount) return;
     PartCullData data = _PartParameters[part];
-    uint bucket, packed;
-    if (CullPart(index, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
-        (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
-        bucket, packed)) AppendVisible(bucket, packed);
+    for (uint split = 0; split < OutputSplitCount(); split++)
+    {
+        uint bucket, packed;
+        if (CullPart(index, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
+            (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
+            CullSplit(split), bucket, packed))
+            AppendVisible(bucket + split * _SplitBucketStride, packed);
+    }
 }
 
 groupshared uint _GroupCounts[4];
 groupshared uint _GroupBases[4];
 
-void AppendVisibleGroup(bool visible, uint part, uint bucket, uint packed, uint lane)
+// splitBase is the first bucket of the split's visible list. Every lane must call this together.
+void AppendVisibleGroup(bool visible, uint part, uint bucket, uint packed, uint lane, uint splitBase)
 {
     uint stride = max(2, _BucketStride);
     if (lane < stride) _GroupCounts[lane] = 0;
@@ -533,45 +584,51 @@ void AppendVisibleGroup(bool visible, uint part, uint bucket, uint packed, uint 
     {
         uint baseOffset = 0;
         uint count = _GroupCounts[lane];
-        if (count > 0) _Arguments.InterlockedAdd((part * stride + lane) * 20 + 4, count, baseOffset);
+        if (count > 0) _Arguments.InterlockedAdd((splitBase + part * stride + lane) * 20 + 4, count, baseOffset);
         _GroupBases[lane] = baseOffset;
     }
     GroupMemoryBarrierWithGroupSync();
 
     if (visible)
     {
-        _Visible.Store((bucket * _Capacity + _GroupBases[localBucket] + localOffset) * 4, packed);
+        _Visible.Store(((splitBase + bucket) * _Capacity + _GroupBases[localBucket] + localOffset) * 4, packed);
     }
 }
 
 [numthreads(64, 1, 1)]
 void CullGrouped(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
-    uint bucket = 0, packed = 0;
-    bool visible = false;
-    if (id.x < (uint)_Count)
+    for (uint split = 0; split < OutputSplitCount(); split++)
     {
-        visible = CullPart(id.x, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
-            _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
-            _PartMaterialFade != 0, bucket, packed);
+        uint bucket = 0, packed = 0;
+        bool visible = false;
+        if (id.x < (uint)_Count)
+        {
+            visible = CullPart(id.x, _Part, _PartData, _PartLod, _PartFlip, _MeshLevel, _MeshLevels,
+                _MeshSelection, _MeshCenter.xyz, _MeshExtents.xyz, _MeshFade != 0,
+                _PartMaterialFade != 0, CullSplit(split), bucket, packed);
+        }
+        AppendVisibleGroup(visible, (uint)_Part, bucket, packed, lane, split * _SplitBucketStride);
     }
-    AppendVisibleGroup(visible, (uint)_Part, bucket, packed, lane);
 }
 
 [numthreads(64, 1, 1)]
 void CullPartsGrouped(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
     uint part = id.y;
-    uint bucket = 0, packed = 0;
-    bool visible = false;
-    if (id.x < (uint)_Count && part < (uint)_PartCount)
+    for (uint split = 0; split < OutputSplitCount(); split++)
     {
-        PartCullData data = _PartParameters[part];
-        visible = CullPart(id.x, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
-            (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
-            bucket, packed);
+        uint bucket = 0, packed = 0;
+        bool visible = false;
+        if (id.x < (uint)_Count && part < (uint)_PartCount)
+        {
+            PartCullData data = _PartParameters[part];
+            visible = CullPart(id.x, part, (uint)data.center.w, (int)data.header.x, (int)data.header.y, (int)data.header.z,
+                (int)data.header.w, data.selection, data.center.xyz, data.extents.xyz, false, false,
+                CullSplit(split), bucket, packed);
+        }
+        AppendVisibleGroup(visible, part, bucket, packed, lane, split * _SplitBucketStride);
     }
-    AppendVisibleGroup(visible, part, bucket, packed, lane);
 }
 
 [numthreads(64, 1, 1)]

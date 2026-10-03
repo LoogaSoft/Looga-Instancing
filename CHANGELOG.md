@@ -2,6 +2,43 @@
 
 ## 0.1.0-preview.14
 
+- Fix: the world hierarchy test treated a view with several splits as the intersection of its splits. A shadow view
+  covers their union, so renderers outside the smallest split, and every renderer in a view with disjoint splits,
+  could skip a shadow cull. Each split is now tested on its own.
+- Add `InstanceRenderer.StaticShadowCaster`, the draws' `BatchFilterSettings.staticShadowCaster`. It defaults to true
+  for static transforms. Shadow renderers can cache these casters (`ShadowObjectsFilter.StaticOnly`) and redraw them
+  when `InstanceShadowSplits.StaticCasterRevision` changes, which every content, visibility, quality, upload or
+  rendering-state change of a static renderer advances. Cached casters keep the shader motion they were drawn with.
+- `InstanceShadowSplits.SetTexelSizes` takes a mask of splits drawn without static casters. Static renderers skip
+  those splits' culling and draws.
+
+- Shadow views with several splits (directional cascades, clipmap levels, point-light faces) keep one visible list per
+  split. Each split draws only the casters inside it. Before, every split drew the casters of all splits: in a
+  2,601-instance test, the four levels of a clipmap shadow drew 2,545 instances instead of 5,668, with identical
+  images. `ShadowSplits` now limits which split lists a prototype is culled into, instead of masking a shared list.
+- Add `InstanceShadowSplits`. A shadow renderer publishes the world texel size of each split of a directional light
+  with `SetTexelSizes` before its cull. Culling then skips casters under `InstanceRenderer.MinimumShadowTexels`
+  (default 2, bound diameter) or `InstanceQualitySettings.MinimumShadowTexels` in that split, and with
+  `ShadowTexelLod` (default on) floors their LOD and mesh LOD at the camera's choice for the same coverage in pixels.
+  Without published sizes, culling is unchanged. `IgnoreCulls` and `ResumeCulls` skip culls whose casters the shadow
+  renderer never draws.
+- Pooled culling views grow their visible lists for split shadow views. `GpuBytes` counts the larger lists.
+  `ProjectedGpuBytes` still assumes one list per view.
+
+- `InstanceRenderer` tests the world hierarchy before it allocates draw commands or records a culling command buffer.
+  A renderer out of range for a camera or shadow view now returns at once. With 300 out-of-range renderers, one
+  render took 3.1 ms instead of 3.5 ms. About 2.3 ms remain for the culling callbacks of 300 renderer groups.
+  Use `InstanceSet` to draw many static sources with one renderer group.
+- Add `InstanceSet.RemoveOtherOwners(keep)`. It removes the entries of every owner that is not in the list, also of
+  destroyed owners.
+- Add `InstanceSet.RemoveOtherPrototypes(owner, keep)`. It removes the entries of one owner whose prototype is not in
+  the list. Other owners do not change.
+- Add `InstanceSet.ConfigureRendering`. It sets the content kind, camera and shadow distances, minimum shadow LOD,
+  quality and visibility mode of all entries, and rebuilds the renderer once.
+- Add read-only `InstanceContainer` properties for its render settings: `MaxDistance`, `ShadowDistance`,
+  `MinimumShadowLod`, `Quality`, `VisibilityMode`, `WorldContentKind`, `MaterialProfile` and `CullingShader`.
+  A tool can copy these settings to an `InstanceSet`. A disabled container keeps its placements for
+  `InstanceColliderResidency`.
 - Add `InstanceSet`. It draws static placements of several prototypes through one `InstanceRenderer`, so each view
   runs one culling callback instead of one for each container. `SetEntry(owner, prototype, placements)` replaces
   the instances of one entry and uploads once. Other entries do not change. Placements have no IDs.

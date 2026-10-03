@@ -145,6 +145,49 @@ namespace LoogaSoft.Instancing
             Synchronize();
         }
 
+        /// <summary>Remove the entries of one owner whose prototype is not in the list.</summary>
+        /// <param name="owner">Owner of the entries to check. Entries of other owners do not change.</param>
+        /// <param name="keep">Prototypes that the owner keeps.</param>
+        /// <returns>Number of removed entries.</returns>
+        public int RemoveOtherPrototypes(Object owner, ICollection<GameObject> keep)
+        {
+            int removed = 0;
+            for (int i = _entries.Count - 1; i >= 0; i--)
+            {
+                Entry entry = _entries[i];
+                if (entry.Owner != owner || (keep != null && entry.Prototype && keep.Contains(entry.Prototype))) continue;
+                RemoveHandles(entry);
+                _entries.RemoveAt(i);
+                removed++;
+            }
+            if (removed > 0)
+            {
+                _renderer?.Flush();
+            }
+            return removed;
+        }
+
+        /// <summary>Remove the entries whose owner is not in the list. Entries of destroyed owners are also removed.</summary>
+        /// <param name="keep">Owners that keep their entries.</param>
+        /// <returns>Number of removed entries.</returns>
+        public int RemoveOtherOwners(ICollection<Object> keep)
+        {
+            int removed = 0;
+            for (int i = _entries.Count - 1; i >= 0; i--)
+            {
+                Entry entry = _entries[i];
+                if (entry.Owner && keep != null && keep.Contains(entry.Owner)) continue;
+                RemoveHandles(entry);
+                _entries.RemoveAt(i);
+                removed++;
+            }
+            if (removed > 0)
+            {
+                _renderer?.Flush();
+            }
+            return removed;
+        }
+
         /// <summary>Number of placements of one owner and prototype, or zero when the entry does not exist.</summary>
         public int GetPlacementCount(Object owner, GameObject prototype)
         {
@@ -170,6 +213,40 @@ namespace LoogaSoft.Instancing
         #endregion
 
         #region Rendering
+        /// <summary>Set the render settings of all entries. The set rebuilds its renderer once.</summary>
+        /// <param name="kind">Spatial layout of the world visibility cells.</param>
+        /// <param name="maxDistance">Maximum camera distance in meters. Use at least 1.</param>
+        /// <param name="shadowDistance">Shadow distance in meters, before adaptive quality.</param>
+        /// <param name="minimumShadowLod">Minimum LOD index for shadows, from 0 to 7.</param>
+        /// <param name="quality">Quality controls for every prototype.</param>
+        /// <param name="visibility">Visibility path of the renderer.</param>
+        public void ConfigureRendering(InstanceWorldContentKind kind, float maxDistance, float shadowDistance,
+            int minimumShadowLod, InstanceQualitySettings quality, InstanceVisibilityMode visibility)
+        {
+            if (!float.IsFinite(maxDistance) || maxDistance < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxDistance));
+            }
+            if (!float.IsFinite(shadowDistance) || shadowDistance < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(shadowDistance));
+            }
+            if (minimumShadowLod < 0 || minimumShadowLod > 7)
+            {
+                throw new ArgumentOutOfRangeException(nameof(minimumShadowLod));
+            }
+            quality.Validate(_entries.Exists(entry => entry.Prototype &&
+                entry.Prototype.GetComponentsInChildren<Collider>(true).Length > 0));
+            _worldContentKind = kind;
+            _maxDistance = maxDistance;
+            _shadowDistance = shadowDistance;
+            _minimumShadowLod = minimumShadowLod;
+            _quality = quality;
+            _visibilityMode = visibility;
+            _rebuildRequested = true;
+            Synchronize();
+        }
+
         /// <summary>Rebuild after a transform, layer or settings change. A static, unchanged set does nothing.</summary>
         public void Synchronize()
         {

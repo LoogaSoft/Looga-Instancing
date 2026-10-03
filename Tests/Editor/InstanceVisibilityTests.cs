@@ -163,6 +163,7 @@ namespace LoogaSoft.Instancing.Tests
                 shader.SetInt("_Count", count);
                 shader.SetInt("_Capacity", count);
                 shader.SetInt("_BucketStride", 4);
+                shader.SetInt("_OutputSplits", 0);
                 shader.SetInt("_Part", 0);
                 shader.SetInt("_PartLod", lod);
                 shader.SetInt("_PartFlip", 0);
@@ -250,6 +251,7 @@ namespace LoogaSoft.Instancing.Tests
                 shader.SetInt("_Count", count);
                 shader.SetInt("_Capacity", count);
                 shader.SetInt("_BucketStride", 2);
+                shader.SetInt("_OutputSplits", 0);
                 shader.SetInt("_PartCount", partCount);
                 shader.SetInt("_SelectionMode", 1);
                 shader.SetInt("_LodCount", 2);
@@ -402,6 +404,7 @@ namespace LoogaSoft.Instancing.Tests
                 shader.SetInt("_Count", count);
                 shader.SetInt("_Capacity", count);
                 shader.SetInt("_BucketStride", buckets);
+                shader.SetInt("_OutputSplits", 0);
                 shader.SetInt("_PartCount", partCount);
                 shader.SetInt("_SelectionMode", 1);
                 shader.SetInt("_LodCount", 1);

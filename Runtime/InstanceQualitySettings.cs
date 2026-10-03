@@ -55,6 +55,11 @@ namespace LoogaSoft.Instancing
         [Range(0, 7)] public int MinimumShadowLod;
         /// <summary>Number of admitted directional shadow cascades. Zero retains every cascade; point and spot projections are unchanged.</summary>
         [Range(0, 16)] public int ShadowSplits;
+        /// <summary>
+        /// Minimum bound diameter in shadow texels of each directional split, where the shadow renderer publishes
+        /// split texel sizes. Zero inherits the renderer value.
+        /// </summary>
+        [Min(0)] public float MinimumShadowTexels;
 
         /// <summary>Full density with inherited renderer shadow limits.</summary>
         public static InstanceQualitySettings Default => new InstanceQualitySettings { Density = 1 };
@@ -71,6 +76,7 @@ namespace LoogaSoft.Instancing
                 !float.IsFinite(ShadowDistance) || ShadowDistance < 0 ||
                 !float.IsFinite(ShadowFadeDistance) || ShadowFadeDistance < 0 ||
                 MinimumShadowLod < 0 || MinimumShadowLod > 7 || ShadowSplits < 0 || ShadowSplits > 16 ||
+                !float.IsFinite(MinimumShadowTexels) || MinimumShadowTexels < 0 ||
                 ShadowMode < InstanceShadowMode.Inherit || ShadowMode > InstanceShadowMode.TwoSided)
             {
                 throw new ArgumentOutOfRangeException(nameof(InstanceQualitySettings));

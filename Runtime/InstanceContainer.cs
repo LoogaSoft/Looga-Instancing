@@ -129,6 +129,22 @@ namespace LoogaSoft.Instancing
         }
         /// <summary>Source placement count, independent of render visibility and component state.</summary>
         public int PlacementCount => _placements?.Length ?? 0;
+        /// <summary>Maximum camera distance in meters.</summary>
+        public float MaxDistance => _maxDistance;
+        /// <summary>Authored shadow distance in meters, before adaptive quality.</summary>
+        public float ShadowDistance => _shadowDistance;
+        /// <summary>Minimum LOD index for shadows.</summary>
+        public int MinimumShadowLod => _minimumShadowLod;
+        /// <summary>Authored quality controls, before adaptive quality.</summary>
+        public InstanceQualitySettings Quality => _quality;
+        /// <summary>Visibility path of the renderer.</summary>
+        public InstanceVisibilityMode VisibilityMode => _visibilityMode;
+        /// <summary>Spatial layout of the world visibility cells.</summary>
+        public InstanceWorldContentKind WorldContentKind => _worldContentKind;
+        /// <summary>Material profile of the prototype, or null.</summary>
+        public InstanceMaterialProfile MaterialProfile => _materialProfile;
+        /// <summary>Custom culling shader, or null for the default shader.</summary>
+        public ComputeShader CullingShader => _cullingShader;
         /// <summary>Last automatic synchronization failure. Explicit API calls throw validation errors.</summary>
         public string Diagnostic { get; private set; }
         /// <summary>Current ownership of this explicit painted or runtime placement population.</summary>

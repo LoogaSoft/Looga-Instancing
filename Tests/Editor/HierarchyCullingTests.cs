@@ -1,6 +1,10 @@
 using System.Collections.Generic;
 using NUnit.Framework;
+using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
 
 namespace LoogaSoft.Instancing.Tests
 {
@@ -62,6 +66,64 @@ namespace LoogaSoft.Instancing.Tests
             var records = new List<InstanceWorldSourceCellRecord>();
             Assert.AreEqual(2, InstanceWorldCells.CopySource("source", records));
             Assert.AreEqual(7, records[0].InstanceCount + records[1].InstanceCount);
+        }
+
+        [Test]
+        public void OutOfRangeRendererRejectsViewAndNearRendererDraws()
+        {
+            if (!(GraphicsSettings.currentRenderPipeline is UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset))
+            {
+                Assert.Ignore("The camera request uses URP.");
+            }
+            Scene scene = EditorSceneManager.NewPreviewScene();
+            var material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+            GameObject source = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            Object.DestroyImmediate(source.GetComponent<Collider>());
+            source.GetComponent<Renderer>().sharedMaterial = material;
+            SceneManager.MoveGameObjectToScene(source, scene);
+            var target = new RenderTexture(128, 128, 24);
+            var cameraObject = new GameObject("Out of range camera");
+            SceneManager.MoveGameObjectToScene(cameraObject, scene);
+            var camera = cameraObject.AddComponent<Camera>();
+            // Both instances are inside the frustum. Only the near instance is inside the 100 m limit.
+            var near = new InstanceRenderer(staticTransforms: true) { MaxDistance = 100 };
+            var far = new InstanceRenderer(staticTransforms: true) { MaxDistance = 100 };
+            try
+            {
+                near.Add(near.Register(InstancePrototype.FromPrefab(source)), Matrix4x4.Translate(new Vector3(0, 2, 10)));
+                far.Add(far.Register(InstancePrototype.FromPrefab(source)), Matrix4x4.Translate(new Vector3(0, 2, 5000)));
+                near.Flush();
+                far.Flush();
+                camera.enabled = false;
+                camera.scene = scene;
+                camera.cullingMask = 1;
+                camera.farClipPlane = 10000;
+                camera.targetTexture = target;
+                camera.transform.SetPositionAndRotation(new Vector3(0, 2, 0), Quaternion.identity);
+                RenderPipeline.SubmitRenderRequest(camera,
+                    new UnityEngine.Rendering.Universal.UniversalRenderPipeline.SingleCameraRequest { destination = target });
+                AsyncGPUReadback.WaitAllRequests();
+
+                Assert.IsFalse(far.LastHierarchyDecision.Visible, "The far renderer must reject the view.");
+                Assert.IsEmpty(far.ReadCameraDrawCounts(camera), "A rejected view must not record draws.");
+                Assert.IsTrue(near.LastHierarchyDecision.Visible);
+                uint drawn = 0;
+                foreach (uint count in near.ReadCameraDrawCounts(camera))
+                {
+                    drawn += count;
+                }
+                Assert.Greater(drawn, 0u, "The near renderer must draw its instance.");
+            }
+            finally
+            {
+                near.Dispose();
+                far.Dispose();
+                camera.targetTexture = null;
+                Object.DestroyImmediate(cameraObject);
+                Object.DestroyImmediate(target);
+                EditorSceneManager.ClosePreviewScene(scene);
+                Object.DestroyImmediate(material);
+            }
         }
     }
 }
